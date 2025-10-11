@@ -1,0 +1,23 @@
+substitutions:
+  _SERVICE: bq-dataset-listener
+  _REGION: us-central1
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      ["build","-t","$_REGION-docker.pkg.dev/$PROJECT_ID/listeners/$_SERVICE:$SHORT_SHA","."]
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      ["push","$_REGION-docker.pkg.dev/$PROJECT_ID/listeners/$_SERVICE:$SHORT_SHA"]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      ["run","deploy","$_SERVICE",
+       "--image","$_REGION-docker.pkg.dev/$PROJECT_ID/listeners/$_SERVICE:$SHORT_SHA",
+       "--region","$_REGION",
+       "--no-allow-unauthenticated",
+       "--quiet"]
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/listeners/$_SERVICE:$SHORT_SHA

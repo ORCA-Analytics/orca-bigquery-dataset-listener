@@ -15,11 +15,11 @@ function splitDataset(datasetId) {
   return m ? { parent: m[1], client: m[2] } : null;
 }
 
-function tPath(parent, rel, tpl) {
-  return `templates/${parent}/${rel ? rel + "/" : ""}${tpl}.sql`;
+function tPath(baseDir, rel, tpl) {
+  return `templates/${baseDir}/${rel ? rel + "/" : ""}${tpl}.sql`;
 }
-function oPath(parent, rel, name) {
-  return `models/${parent}/${rel ? rel + "/" : ""}${name}`;
+function oPath(baseDir, rel, name) {
+  return `models/${baseDir}/${rel ? rel + "/" : ""}${name}`;
 }
 
 const CATALOG = {
@@ -105,8 +105,12 @@ const CATALOG = {
       { rel: "creative", tpl: "tiktok_ads_creative" },
     ],
   },
-  hdyhau_fairing: { entries: [{ rel: "", tpl: "fairing_hdyhau" }] },
-  hdyhau_knocommerce: { 
+  fairing: { 
+    dir: "hdyhau_fairing",
+    entries: [{ rel: "", tpl: "fairing_hdyhau" }] 
+  },
+  knocommerce: { 
+    dir: "hdyhau_knocommerce",
     entries: [
       { rel: "all_responses", tpl: "knocommerce_allresponses" },
       { rel: "hdyhau", tpl: "knocommerce_hdyhau" }
@@ -131,11 +135,12 @@ function buildPlan(datasetId, projectId) {
   const cfg = CATALOG[parent];
   if (!cfg) return null;
 
+  const baseDir = cfg.dir || parent; // <— use alias if provided
   const files = [];
   for (const e of cfg.entries) {
-    const template = tPath(parent, e.rel, e.tpl);
+    const template = tPath(baseDir, e.rel, e.tpl);
     const outName = e.out ? e.out(e.tpl, client) : `${e.tpl}__${client}.sql`;
-    files.push({ template, path: oPath(parent, e.rel, outName) });
+    files.push({ template, path: oPath(baseDir, e.rel, outName) });
   }
   return { files, vars: { datasetId, parent, client, project: projectId } };
 }

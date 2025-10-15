@@ -77,7 +77,7 @@ const CATALOG = {
       { rel: "product_firstbasket", tpl: "shopify_product_firstbasket" },
       {
         rel: "product_firstsecondorder",
-        tpl: "shopify_product_firstsecondorder",
+        tpl: "shopify_product_firstsecondpurchase",
       },
       { rel: "product_ltr_journey", tpl: "shopify_product_ltrjourney" },
       { rel: "product_ltr", tpl: "shopify_product_ltr" },

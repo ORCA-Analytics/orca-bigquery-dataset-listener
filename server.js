@@ -94,6 +94,7 @@ const CATALOG = {
     entries: [
       { rel: "amazon_ads", tpl: "amazon_ads" },
       { rel: "amazon_sellercentral", tpl: "amazon_sellercentral" }
+      { rel: "amazon_sellercentral_cohorts", tpl: "amazon_sellercentral_cohorts" }
     ]},
   applovin: { entries: [{ rel: "", tpl: "applovin" }] },
   bing_ads: { entries: [{ rel: "", tpl: "bing_ads" }] },

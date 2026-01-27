@@ -27,6 +27,7 @@ const CATALOG = {
     entries: [
       { rel: "campaigns", tpl: "facebook_ads" },
       { rel: "creative", tpl: "facebook_ads_creative" },
+      { rel: "spendcohorts", tpl: "facebook_ads_spendcohorts" },
     ],
   },
   google_ads: {

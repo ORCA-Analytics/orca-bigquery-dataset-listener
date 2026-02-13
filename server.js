@@ -74,6 +74,7 @@ const CATALOG = {
       // Standard
       { rel: "cohort", tpl: "shopify_cohort" },
       { rel: "newreturn", tpl: "shopify_newreturn" },
+      { rel: "orderlines", tpl: "shopify_orderlines" },
       { rel: "orders", tpl: "shopify_orders" },
       { rel: "product_firstbasket", tpl: "shopify_product_firstbasket" },
       {
@@ -94,7 +95,7 @@ const CATALOG = {
   amazon: { 
     entries: [
       { rel: "amazon_ads", tpl: "amazon_ads" },
-      { rel: "amazon_sellercentral", tpl: "amazon_sellercentral" }
+      { rel: "amazon_sellercentral", tpl: "amazon_sellercentral" },
       { rel: "amazon_sellercentral_cohorts", tpl: "amazon_sellercentral_cohorts" }
     ]},
   applovin: { entries: [{ rel: "", tpl: "applovin" }] },

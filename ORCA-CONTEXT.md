@@ -94,7 +94,7 @@ orca-bigquery-dataset-listener/
 flowchart LR
     BQDataset[BigQuery Dataset Created] --> AuditLog[GCP Audit Logs]
     AuditLog --> PubSub[Pub/Sub Topic]
-    PubSub --> Listener[bq-dataset-listener Cloud Run]
+    PubSub --> Listener[orca-bigquery-dataset-listener Cloud Run]
     Listener --> GitHubAPI[GitHub API]
     GitHubAPI --> DBTRepo[orca-dbt repo workflow]
     DBTRepo --> NewFiles[Client-specific SQL models]
@@ -146,6 +146,7 @@ flowchart LR
 - **Global fetch:** Uses Node 18+ native `fetch` (no `node-fetch` import needed) - see commit `58092e6`
 - **204 responses for non-matches:** Returning 204 instead of 404/400 when dataset doesn't match catalog is intentional (Pub/Sub retries on errors)
 - **429 responses while waiting:** Expected. A 429 means "tables not there yet"; Pub/Sub redelivers on the subscription's retry policy. Look for `WAITING_FOR_TABLES` log lines
+- **Service name:** the Cloud Run service is `orca-bigquery-dataset-listener`. `_SERVICE` in `cloudbuild.yaml` must match it, or a manual `gcloud builds submit` deploys a second, separate service
 - **Dispatching when the table check fails:** Intentional fail-open, so a missing permission or BigQuery outage never blocks scaffolding (logged as `TABLE_CHECK_FAILED`)
 
 ### Fragile Areas
@@ -179,7 +180,7 @@ Do these before merging the table-check change (merging deploys). If the code de
 
 ```bash
 # 1. Let the Cloud Run service list BigQuery tables
-SA=$(gcloud run services describe bq-dataset-listener --region us-central1 \
+SA=$(gcloud run services describe orca-bigquery-dataset-listener --region us-central1 \
   --format='value(spec.template.spec.serviceAccountName)')
 # (empty = the default compute service account, <PROJECT_NUMBER>-compute@developer.gserviceaccount.com)
 gcloud projects add-iam-policy-binding orcaanalytics \
@@ -205,8 +206,8 @@ Retention must exceed `MAX_WAIT_HOURS` (the 7-day default does). A dead-letter p
 2. Cloud Build trigger automatically runs `cloudbuild.yaml`
 3. Steps:
    - Builds Docker image tagged with `$SHORT_SHA`
-   - Pushes to Artifact Registry (`us-central1-docker.pkg.dev/.../listeners/bq-dataset-listener`)
-   - Deploys to Cloud Run service `bq-dataset-listener` in `us-central1`
+   - Pushes to Artifact Registry (`us-central1-docker.pkg.dev/.../listeners/orca-bigquery-dataset-listener`)
+   - Deploys to Cloud Run service `orca-bigquery-dataset-listener` in `us-central1`
    - Service requires authentication (`--no-allow-unauthenticated`)
 
 **Manual:**
@@ -220,10 +221,10 @@ Cloud Run keeps previous revisions:
 
 ```bash
 # List revisions
-gcloud run revisions list --service=bq-dataset-listener --region=us-central1
+gcloud run revisions list --service=orca-bigquery-dataset-listener --region=us-central1
 
 # Route 100% traffic to previous revision
-gcloud run services update-traffic bq-dataset-listener \
+gcloud run services update-traffic orca-bigquery-dataset-listener \
   --region=us-central1 \
   --to-revisions=PREVIOUS_REVISION_NAME=100
 ```

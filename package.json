@@ -1,10 +1,14 @@
 {
-    "name": "bq-dataset-listener",
-    "version": "1.0.0",
-    "main": "server.js",
-    "type": "commonjs",
-    "dependencies": {
-      "express": "^4.19.2"
-    }
+  "name": "bq-dataset-listener",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@google-cloud/bigquery": "^9.1.0",
+    "express": "^4.19.2"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
   }
-  
+}

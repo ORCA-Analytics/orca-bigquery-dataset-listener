@@ -1,5 +1,5 @@
 substitutions:
-  _SERVICE: bq-dataset-listener
+  _SERVICE: orca-bigquery-dataset-listener
   _REGION: us-central1
 
 steps:

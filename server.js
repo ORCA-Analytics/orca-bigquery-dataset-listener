@@ -29,6 +29,14 @@ function oPath(baseDir, rel, name) {
 // `tables` lists the raw tables each template reads, as "dataset.table" with
 // {client} filled in at dispatch time. The listener waits for all of them to
 // exist before dispatching, so keep them in sync with the templates in orca-dbt.
+// "dataset.a|b" is satisfied by either table (loaders name some tables
+// differently, e.g. Airbyte `Orders` vs Fivetran `orders`).
+//
+// `requireSomeTables` drops a dataset that still has none of its tables after
+// the max wait instead of dispatching anyway. Amazon datasets come with many
+// suffixes after the client (amazon_sellercentral__acme_airbyte_fulfillments,
+// Fivetran dbt-package outputs like amazon_ads__acme_amazon_ads_source) and
+// only some of them are the raw source a template reads.
 const CATALOG = {
   facebook_ads: {
     entries: [
@@ -131,7 +139,9 @@ const CATALOG = {
       { rel: "shopify_pixel/percent_of_orders", tpl: "shopify_pixel_percentoforders" },
     ],
   },
-  amazon: {
+  amazon_ads: {
+    dir: "amazon",
+    requireSomeTables: true,
     entries: [
       {
         rel: "amazon_ads",
@@ -143,15 +153,26 @@ const CATALOG = {
           "amazon_ads__{client}.sb_campaign_report",
         ],
       },
+    ],
+  },
+  amazon_sellercentral: {
+    dir: "amazon",
+    requireSomeTables: true,
+    entries: [
       {
         rel: "amazon_sellercentral",
         tpl: "amazon_sellercentral",
-        tables: ["amazon_sellercentral__{client}.sales_and_traffic_business_report_daily"],
+        tables: ["amazon_sellercentral__{client}.GET_SALES_AND_TRAFFIC_REPORT|sales_and_traffic_business_report_daily"],
       },
       {
         rel: "amazon_sellercentral_cohorts",
         tpl: "amazon_sellercentral_cohorts",
-        tables: ["amazon_sellercentral__{client}.orders"],
+        tables: ["amazon_sellercentral__{client}.Orders|orders"],
+      },
+      {
+        rel: "amazon_sellercentral_newreturn",
+        tpl: "amazon_sellercentral_newreturn",
+        tables: ["amazon_sellercentral__{client}.Orders|orders"],
       },
     ],
   },
@@ -248,12 +269,18 @@ function buildPlan(datasetId, projectId) {
     files.push({ template, path: oPath(baseDir, e.rel, outName) });
     for (const t of e.tables || []) tables.add(t.replace("{client}", client));
   }
-  return { files, tables: [...tables], vars: { datasetId, parent, client, project: projectId } };
+  return {
+    files,
+    tables: [...tables],
+    requireSomeTables: Boolean(cfg.requireSomeTables),
+    vars: { datasetId, parent, client, project: projectId },
+  };
 }
 
 // --- 2️⃣ Table readiness ---
-// Returns the "dataset.table" entries that don't exist yet. A dataset that
-// doesn't exist yet counts as all of its tables missing.
+// Returns the "dataset.table" entries that don't exist yet ("dataset.a|b" is
+// there when either table is). A dataset that doesn't exist yet counts as all
+// of its tables missing.
 async function findMissingTables(bigquery, tables) {
   const byDataset = new Map();
   for (const t of tables) {
@@ -264,18 +291,23 @@ async function findMissingTables(bigquery, tables) {
 
   const missing = [];
   for (const [dataset, wanted] of byDataset) {
-    let existing = new Set();
-    try {
-      const [found] = await bigquery.dataset(dataset).getTables();
-      existing = new Set(found.map((t) => t.id));
-    } catch (e) {
-      if (e.code !== 404) throw e;
-    }
+    const existing = await listTables(bigquery, dataset);
     for (const table of wanted) {
-      if (!existing.has(table)) missing.push(`${dataset}.${table}`);
+      if (!table.split("|").some((name) => existing.has(name))) missing.push(`${dataset}.${table}`);
     }
   }
   return missing;
+}
+
+// The dataset's table names; empty when the dataset doesn't exist (yet).
+async function listTables(bigquery, dataset) {
+  try {
+    const [found] = await bigquery.dataset(dataset).getTables();
+    return new Set(found.map((t) => t.id));
+  } catch (e) {
+    if (e.code !== 404) throw e;
+    return new Set();
+  }
 }
 
 // --- 3️⃣ Company settings ---
@@ -291,14 +323,31 @@ const COMPANY_FLAGS = {
   snapchat_ads: { column: "snapchat_ads", value: true, unset: false },
   twitter_ads: { column: "twitter_ads", value: true, unset: false },
   applovin: { column: "applovin_ads", value: true, unset: false },
-  amazon: { column: "amazon", value: true, unset: false },
   fairing: { column: "hdyhau", value: "Fairing", unset: "none" },
   knocommerce: { column: "hdyhau", value: "KnoCommerce", unset: "none" },
 };
 
+// Every amazon* dataset turns on `amazon`: amazon_ads, amazon_sellercentral,
+// and names without a template (e.g. amazong_ads__acme). The client part often
+// carries a suffix (acme_airbyte, acme_us_fivetran), so the company is the one
+// whose table_identifier the client starts with, and the flag waits only for
+// the dataset to hold any table rather than for a template's tables.
+const AMAZON_FLAG = { column: "amazon", value: true, unset: false, matchClientPrefix: true };
+
+function companyFlagFor(parent) {
+  return COMPANY_FLAGS[parent] || (parent.startsWith("amazon") ? AMAZON_FLAG : null);
+}
+
+// "acme_us_airbyte" -> ["acme", "acme_us", "acme_us_airbyte"]
+function clientPrefixes(client) {
+  const parts = client.split("_");
+  return parts.map((_, i) => parts.slice(0, i + 1).join("_")).filter(Boolean);
+}
+
 // Turns on the company setting for a new source, via Supabase's REST API.
-// Matches the company on `table_identifier` (the dataset's client part) and
-// only writes when exactly one company matches and the column is still unset.
+// Matches the company on `table_identifier` (the dataset's client part, or for
+// Amazon the longest table_identifier it starts with) and only writes when
+// exactly one company matches and the column is still unset.
 function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
   const headers = {
     apikey: serviceRoleKey,
@@ -319,13 +368,18 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
   }
 
   return async function setCompanyFlag({ parent, client }) {
-    const flag = COMPANY_FLAGS[parent];
+    const flag = companyFlagFor(parent);
     if (!flag) return { status: "no_flag" };
     const { column, value, unset } = flag;
 
-    const companies = await request(
-      `companies?table_identifier=eq.${encodeURIComponent(client)}&select=id,name,${column}`
-    );
+    const match = flag.matchClientPrefix
+      ? `in.(${clientPrefixes(client).map(encodeURIComponent).join(",")})`
+      : `eq.${encodeURIComponent(client)}`;
+    const rows = await request(`companies?table_identifier=${match}&select=id,name,table_identifier,${column}`);
+    // Longest match wins, so acme_us_airbyte picks acme_us over acme.
+    const idOf = (r) => String(r.table_identifier ?? "");
+    const tableIdentifier = rows.reduce((best, r) => (idOf(r).length > best.length ? idOf(r) : best), "");
+    const companies = rows.filter((r) => idOf(r) === tableIdentifier);
     if (companies.length !== 1) return { status: "company_not_unique", column, matches: companies.length };
 
     const company = companies[0];
@@ -399,7 +453,10 @@ function createApp({
       });
 
       const plan = buildPlan(datasetId, PROJECT);
-      if (!plan) {
+      const parts = splitDataset(datasetId);
+      const flag = parts && companyFlagFor(parts.parent);
+      // amazon* datasets without a template still turn on the company setting.
+      if (!plan && !flag) {
         console.log("No matching template plan for:", datasetId);
         return res.status(204).end();
       }
@@ -409,45 +466,55 @@ function createApp({
       const createdAt = Date.parse(data?.timestamp || msg?.publishTime || "") || now();
       const waitedHours = Math.round(((now() - createdAt) / 3600000) * 10) / 10;
 
+      // A plan waits for its template's tables; the Amazon setting only for the
+      // dataset to hold any table.
       let missing = [];
+      let landed = false;
       let tablesChecked = false;
       try {
-        missing = await findMissingTables(bigquery, plan.tables);
+        if (plan) missing = await findMissingTables(bigquery, plan.tables);
+        if (flag?.matchClientPrefix) landed = (await listTables(bigquery, datasetId)).size > 0;
         tablesChecked = true;
       } catch (e) {
         // Can't check (e.g. no BigQuery permission): dispatch now, as before.
         console.error("TABLE_CHECK_FAILED", { datasetId, error: e.message });
       }
 
-      if (missing.length && waitedHours < maxWaitHours) {
+      const waiting = plan ? missing.length > 0 : tablesChecked && !landed;
+      if (waiting && waitedHours < maxWaitHours) {
         console.log("WAITING_FOR_TABLES", { datasetId, missing, waitedHours });
         // Any non-2xx response makes Pub/Sub redeliver the message later.
         return res.status(429).end();
       }
-      if (missing.length) {
-        console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
+
+      if (plan) {
+        const nothingLanded = tablesChecked && plan.tables.length > 0 && missing.length === plan.tables.length;
+        if (plan.requireSomeTables && nothingLanded) {
+          console.warn("NOT_DISPATCHING", { datasetId, reason: "none of the template's tables landed", missing, waitedHours });
+        } else {
+          if (missing.length) {
+            console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
+          }
+          await dispatch({
+            datasetId,
+            files: plan.files,
+            vars: plan.vars,
+            missingTables: missing,
+          });
+          console.log("✅ Dispatched to GitHub for", datasetId);
+        }
       }
-
-      await dispatch({
-        datasetId,
-        files: plan.files,
-        vars: plan.vars,
-        missingTables: missing,
-      });
-
-      console.log("✅ Dispatched to GitHub for", datasetId);
 
       // Only once the first sync has landed: a dataset still missing tables
       // after the max wait points at a broken connector, not live data, and a
       // failed table check proves nothing either way.
       // Errors are logged, not returned, because a retry would re-dispatch.
-      if (setCompanyFlag && !tablesChecked) {
+      if (setCompanyFlag && flag && !tablesChecked) {
         console.log("COMPANY_FLAG_SKIPPED", { datasetId, status: "tables_unchecked" });
-      } else if (setCompanyFlag && !missing.length) {
+      } else if (setCompanyFlag && flag && (flag.matchClientPrefix ? landed : !missing.length)) {
         try {
-          const result = await setCompanyFlag({ parent: plan.vars.parent, client: plan.vars.client });
-          const event = result.status === "set" ? "COMPANY_FLAG_SET" : "COMPANY_FLAG_SKIPPED";
-          if (result.status !== "no_flag") console.log(event, { datasetId, ...result });
+          const result = await setCompanyFlag({ parent: parts.parent, client: parts.client });
+          console.log(result.status === "set" ? "COMPANY_FLAG_SET" : "COMPANY_FLAG_SKIPPED", { datasetId, ...result });
         } catch (e) {
           console.error("COMPANY_FLAG_FAILED", { datasetId, error: e.message });
         }

@@ -9,6 +9,9 @@ const GH_REPO = "orca-dbt";
 const PROJECT = "orcaanalytics";
 // How long to keep waiting for a new dataset's tables before dispatching anyway.
 const MAX_WAIT_HOURS = Number(process.env.MAX_WAIT_HOURS || 72);
+// Supabase project with the `companies` table the ORCA app reads its settings from.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // stored in Secret Manager
 
 // --- 1️⃣ buildPlan logic ---
 function splitDataset(datasetId) {
@@ -275,7 +278,66 @@ async function findMissingTables(bigquery, tables) {
   return missing;
 }
 
-// --- 3️⃣ GitHub dispatch helper ---
+// --- 3️⃣ Company settings ---
+// The `companies` column a new source turns on in the ORCA app, and the
+// "not set up" value it may replace. A column that already holds anything
+// else (e.g. hdyhau = 'Custom') was set by hand and is left alone.
+const COMPANY_FLAGS = {
+  facebook_ads: { column: "facebook_ads", value: true, unset: false },
+  google_ads: { column: "google_ads", value: true, unset: false },
+  tiktok_ads: { column: "tiktok_ads", value: true, unset: false },
+  bing_ads: { column: "bing_ads", value: true, unset: false },
+  pinterest_ads: { column: "pinterest_ads", value: true, unset: false },
+  snapchat_ads: { column: "snapchat_ads", value: true, unset: false },
+  twitter_ads: { column: "twitter_ads", value: true, unset: false },
+  applovin: { column: "applovin_ads", value: true, unset: false },
+  amazon: { column: "amazon", value: true, unset: false },
+  fairing: { column: "hdyhau", value: "Fairing", unset: "none" },
+  knocommerce: { column: "hdyhau", value: "KnoCommerce", unset: "none" },
+};
+
+// Turns on the company setting for a new source, via Supabase's REST API.
+// Matches the company on `table_identifier` (the dataset's client part) and
+// only writes when exactly one company matches and the column is still unset.
+function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch }) {
+  const headers = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": "application/json",
+  };
+
+  async function request(path, init = {}) {
+    const resp = await fetchImpl(`${url}/rest/v1/${path}`, { ...init, headers: { ...headers, ...init.headers } });
+    if (!resp.ok) throw new Error(`Supabase ${init.method || "GET"} failed: ${resp.status} ${await resp.text()}`);
+    return resp.json();
+  }
+
+  return async function setCompanyFlag({ parent, client }) {
+    const flag = COMPANY_FLAGS[parent];
+    if (!flag) return { status: "no_flag" };
+    const { column, value, unset } = flag;
+
+    const companies = await request(
+      `companies?table_identifier=eq.${encodeURIComponent(client)}&select=id,name,${column}`
+    );
+    if (companies.length !== 1) return { status: "company_not_unique", column, matches: companies.length };
+
+    const company = companies[0];
+    const current = company[column];
+    if (current !== null && current !== unset) return { status: "already_set", column, company: company.name, current };
+
+    // The unset filter is repeated in the update so a value someone set in the
+    // meantime is never overwritten.
+    const updated = await request(
+      `companies?id=eq.${company.id}&or=(${column}.is.null,${column}.eq.${unset})`,
+      { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ [column]: value }) }
+    );
+    if (!updated.length) return { status: "already_set", column, company: company.name };
+    return { status: "set", column, company: company.name, from: current, to: value };
+  };
+}
+
+// --- 4️⃣ GitHub dispatch helper ---
 async function dispatchToGitHub(payload) {
   const resp = await fetch(
     `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/dispatches`,
@@ -300,8 +362,14 @@ async function dispatchToGitHub(payload) {
   }
 }
 
-// --- 4️⃣ Express routes ---
-function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT_HOURS }) {
+// --- 5️⃣ Express routes ---
+function createApp({
+  bigquery,
+  dispatch,
+  setCompanyFlag = null,
+  now = Date.now,
+  maxWaitHours = MAX_WAIT_HOURS,
+}) {
   const app = express();
   app.use(express.json());
 
@@ -360,6 +428,20 @@ function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT
       });
 
       console.log("✅ Dispatched to GitHub for", datasetId);
+
+      // Only once the first sync has landed: a dataset still missing tables
+      // after the max wait points at a broken connector, not live data.
+      // Errors are logged, not returned, because a retry would re-dispatch.
+      if (setCompanyFlag && !missing.length) {
+        try {
+          const result = await setCompanyFlag({ parent: plan.vars.parent, client: plan.vars.client });
+          const event = result.status === "set" ? "COMPANY_FLAG_SET" : "COMPANY_FLAG_SKIPPED";
+          if (result.status !== "no_flag") console.log(event, { datasetId, ...result });
+        } catch (e) {
+          console.error("COMPANY_FLAG_FAILED", { datasetId, error: e.message });
+        }
+      }
+
       res.status(204).end();
     } catch (e) {
       console.error("Handler error:", e);
@@ -371,12 +453,18 @@ function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT
 }
 
 if (require.main === module) {
+  const setCompanyFlag =
+    SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+      ? createCompanyFlagSetter({ url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY })
+      : null;
+  if (!setCompanyFlag) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set");
   const app = createApp({
     bigquery: new BigQuery({ projectId: PROJECT }),
     dispatch: dispatchToGitHub,
+    setCompanyFlag,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
 }
 
-module.exports = { CATALOG, buildPlan, findMissingTables, createApp };
+module.exports = { CATALOG, COMPANY_FLAGS, buildPlan, findMissingTables, createCompanyFlagSetter, createApp };

@@ -264,10 +264,10 @@ function fakeSupabase({ companies = [], patched } = {}) {
 }
 
 test("sets hdyhau to Fairing when it's still 'none'", async () => {
-  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, name: "Acme", hdyhau: "none" }] });
+  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, company_name: "Acme", hdyhau: "none" }] });
   const result = await setCompanyFlag({ parent: "fairing", client: "acme" });
   assert.deepEqual(result, { status: "set", column: "hdyhau", company: "Acme", from: "none", to: "Fairing" });
-  assert.equal(requests[0].url, "https://sb.test/rest/v1/companies?table_identifier=eq.acme&select=id,name,table_identifier,hdyhau");
+  assert.equal(requests[0].url, "https://sb.test/rest/v1/companies?table_identifier=eq.acme&select=id,company_name,table_identifier,hdyhau");
   assert.equal(requests[1].method, "PATCH");
   assert.equal(requests[1].url, "https://sb.test/rest/v1/companies?id=eq.7&or=(hdyhau.is.null,hdyhau.eq.none)");
   assert.deepEqual(requests[1].body, { hdyhau: "Fairing" });
@@ -275,7 +275,7 @@ test("sets hdyhau to Fairing when it's still 'none'", async () => {
 });
 
 test("turns on a boolean ad platform flag", async () => {
-  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, name: "Acme", applovin_ads: null }] });
+  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, company_name: "Acme", applovin_ads: null }] });
   const result = await setCompanyFlag({ parent: "applovin", client: "acme" });
   assert.equal(result.status, "set");
   assert.equal(requests[1].url, "https://sb.test/rest/v1/companies?id=eq.7&or=(applovin_ads.is.null,applovin_ads.eq.false)");
@@ -283,7 +283,7 @@ test("turns on a boolean ad platform flag", async () => {
 });
 
 test("never overwrites a value that was set by hand", async () => {
-  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, name: "Acme", hdyhau: "Custom" }] });
+  const { setCompanyFlag, requests } = fakeSupabase({ companies: [{ id: 7, company_name: "Acme", hdyhau: "Custom" }] });
   const result = await setCompanyFlag({ parent: "fairing", client: "acme" });
   assert.equal(result.status, "already_set");
   assert.equal(result.current, "Custom");
@@ -291,7 +291,7 @@ test("never overwrites a value that was set by hand", async () => {
 });
 
 test("reports already_set when the conditional update matches no row", async () => {
-  const { setCompanyFlag } = fakeSupabase({ companies: [{ id: 7, name: "Acme", hdyhau: "none" }], patched: [] });
+  const { setCompanyFlag } = fakeSupabase({ companies: [{ id: 7, company_name: "Acme", hdyhau: "none" }], patched: [] });
   assert.equal((await setCompanyFlag({ parent: "fairing", client: "acme" })).status, "already_set");
 });
 
@@ -308,15 +308,15 @@ test("skips when no company or several companies match the client", async () => 
 test("matches Amazon datasets on the longest table_identifier the client starts with", async () => {
   const { setCompanyFlag, requests } = fakeSupabase({
     companies: [
-      { id: 1, name: "Acme", table_identifier: "acme", amazon: false },
-      { id: 2, name: "Acme US", table_identifier: "acme_us", amazon: null },
+      { id: 1, company_name: "Acme", table_identifier: "acme", amazon: false },
+      { id: 2, company_name: "Acme US", table_identifier: "acme_us", amazon: null },
     ],
   });
   const result = await setCompanyFlag({ parent: "amazon_sellercentral", client: "acme_us_airbyte" });
   assert.deepEqual(result, { status: "set", column: "amazon", company: "Acme US", from: null, to: true });
   assert.equal(
     requests[0].url,
-    "https://sb.test/rest/v1/companies?table_identifier=in.(acme,acme_us,acme_us_airbyte)&select=id,name,table_identifier,amazon"
+    "https://sb.test/rest/v1/companies?table_identifier=in.(acme,acme_us,acme_us_airbyte)&select=id,company_name,table_identifier,amazon"
   );
   assert.equal(requests[1].url, "https://sb.test/rest/v1/companies?id=eq.2&or=(amazon.is.null,amazon.eq.false)");
   assert.deepEqual(requests[1].body, { amazon: true });

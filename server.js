@@ -375,7 +375,7 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
     const match = flag.matchClientPrefix
       ? `in.(${clientPrefixes(client).map(encodeURIComponent).join(",")})`
       : `eq.${encodeURIComponent(client)}`;
-    const rows = await request(`companies?table_identifier=${match}&select=id,name,table_identifier,${column}`);
+    const rows = await request(`companies?table_identifier=${match}&select=id,company_name,table_identifier,${column}`);
     // Longest match wins, so acme_us_airbyte picks acme_us over acme.
     const idOf = (r) => String(r.table_identifier ?? "");
     const tableIdentifier = rows.reduce((best, r) => (idOf(r).length > best.length ? idOf(r) : best), "");
@@ -384,7 +384,7 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
 
     const company = companies[0];
     const current = company[column];
-    if (current !== null && current !== unset) return { status: "already_set", column, company: company.name, current };
+    if (current !== null && current !== unset) return { status: "already_set", column, company: company.company_name, current };
 
     // The unset filter is repeated in the update so a value someone set in the
     // meantime is never overwritten.
@@ -392,8 +392,8 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
       `companies?id=eq.${company.id}&or=(${column}.is.null,${column}.eq.${unset})`,
       { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ [column]: value }) }
     );
-    if (!updated.length) return { status: "already_set", column, company: company.name };
-    return { status: "set", column, company: company.name, from: current, to: value };
+    if (!updated.length) return { status: "already_set", column, company: company.company_name };
+    return { status: "set", column, company: company.company_name, from: current, to: value };
   };
 }
 

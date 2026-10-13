@@ -9,6 +9,9 @@ const GH_REPO = "orca-dbt";
 const PROJECT = "orcaanalytics";
 // How long to keep waiting for a new dataset's tables before dispatching anyway.
 const MAX_WAIT_HOURS = Number(process.env.MAX_WAIT_HOURS || 72);
+// Supabase project with the `companies` table the ORCA app reads its settings from.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // stored in Secret Manager
 
 // --- 1️⃣ buildPlan logic ---
 function splitDataset(datasetId) {
@@ -26,6 +29,14 @@ function oPath(baseDir, rel, name) {
 // `tables` lists the raw tables each template reads, as "dataset.table" with
 // {client} filled in at dispatch time. The listener waits for all of them to
 // exist before dispatching, so keep them in sync with the templates in orca-dbt.
+// "dataset.a|b" is satisfied by either table (loaders name some tables
+// differently, e.g. Airbyte `Orders` vs Fivetran `orders`).
+//
+// `requireSomeTables` drops a dataset that still has none of its tables after
+// the max wait instead of dispatching anyway. Amazon datasets come with many
+// suffixes after the client (amazon_sellercentral__acme_airbyte_fulfillments,
+// Fivetran dbt-package outputs like amazon_ads__acme_amazon_ads_source) and
+// only some of them are the raw source a template reads.
 const CATALOG = {
   facebook_ads: {
     entries: [
@@ -128,7 +139,9 @@ const CATALOG = {
       { rel: "shopify_pixel/percent_of_orders", tpl: "shopify_pixel_percentoforders" },
     ],
   },
-  amazon: {
+  amazon_ads: {
+    dir: "amazon",
+    requireSomeTables: true,
     entries: [
       {
         rel: "amazon_ads",
@@ -140,15 +153,26 @@ const CATALOG = {
           "amazon_ads__{client}.sb_campaign_report",
         ],
       },
+    ],
+  },
+  amazon_sellercentral: {
+    dir: "amazon",
+    requireSomeTables: true,
+    entries: [
       {
         rel: "amazon_sellercentral",
         tpl: "amazon_sellercentral",
-        tables: ["amazon_sellercentral__{client}.sales_and_traffic_business_report_daily"],
+        tables: ["amazon_sellercentral__{client}.GET_SALES_AND_TRAFFIC_REPORT|sales_and_traffic_business_report_daily"],
       },
       {
         rel: "amazon_sellercentral_cohorts",
         tpl: "amazon_sellercentral_cohorts",
-        tables: ["amazon_sellercentral__{client}.orders"],
+        tables: ["amazon_sellercentral__{client}.Orders|orders"],
+      },
+      {
+        rel: "amazon_sellercentral_newreturn",
+        tpl: "amazon_sellercentral_newreturn",
+        tables: ["amazon_sellercentral__{client}.Orders|orders"],
       },
     ],
   },
@@ -245,12 +269,18 @@ function buildPlan(datasetId, projectId) {
     files.push({ template, path: oPath(baseDir, e.rel, outName) });
     for (const t of e.tables || []) tables.add(t.replace("{client}", client));
   }
-  return { files, tables: [...tables], vars: { datasetId, parent, client, project: projectId } };
+  return {
+    files,
+    tables: [...tables],
+    requireSomeTables: Boolean(cfg.requireSomeTables),
+    vars: { datasetId, parent, client, project: projectId },
+  };
 }
 
 // --- 2️⃣ Table readiness ---
-// Returns the "dataset.table" entries that don't exist yet. A dataset that
-// doesn't exist yet counts as all of its tables missing.
+// Returns the "dataset.table" entries that don't exist yet ("dataset.a|b" is
+// there when either table is). A dataset that doesn't exist yet counts as all
+// of its tables missing.
 async function findMissingTables(bigquery, tables) {
   const byDataset = new Map();
   for (const t of tables) {
@@ -261,21 +291,113 @@ async function findMissingTables(bigquery, tables) {
 
   const missing = [];
   for (const [dataset, wanted] of byDataset) {
-    let existing = new Set();
-    try {
-      const [found] = await bigquery.dataset(dataset).getTables();
-      existing = new Set(found.map((t) => t.id));
-    } catch (e) {
-      if (e.code !== 404) throw e;
-    }
+    const existing = await listTables(bigquery, dataset);
     for (const table of wanted) {
-      if (!existing.has(table)) missing.push(`${dataset}.${table}`);
+      if (!table.split("|").some((name) => existing.has(name))) missing.push(`${dataset}.${table}`);
     }
   }
   return missing;
 }
 
-// --- 3️⃣ GitHub dispatch helper ---
+// The dataset's table names; empty when the dataset doesn't exist (yet).
+async function listTables(bigquery, dataset) {
+  try {
+    const [found] = await bigquery.dataset(dataset).getTables();
+    return new Set(found.map((t) => t.id));
+  } catch (e) {
+    if (e.code !== 404) throw e;
+    return new Set();
+  }
+}
+
+// --- 3️⃣ Company settings ---
+// The `companies` column a new source turns on in the ORCA app, and the
+// "not set up" value it may replace. A column that already holds anything
+// else (e.g. hdyhau = 'Custom') was set by hand and is left alone.
+const COMPANY_FLAGS = {
+  facebook_ads: { column: "facebook_ads", value: true, unset: false },
+  google_ads: { column: "google_ads", value: true, unset: false },
+  tiktok_ads: { column: "tiktok_ads", value: true, unset: false },
+  bing_ads: { column: "bing_ads", value: true, unset: false },
+  pinterest_ads: { column: "pinterest_ads", value: true, unset: false },
+  snapchat_ads: { column: "snapchat_ads", value: true, unset: false },
+  twitter_ads: { column: "twitter_ads", value: true, unset: false },
+  applovin: { column: "applovin_ads", value: true, unset: false },
+  fairing: { column: "hdyhau", value: "Fairing", unset: "none" },
+  knocommerce: { column: "hdyhau", value: "KnoCommerce", unset: "none" },
+};
+
+// Every amazon* dataset turns on `amazon`: amazon_ads, amazon_sellercentral,
+// and names without a template (e.g. amazong_ads__acme). The client part often
+// carries a suffix (acme_airbyte, acme_us_fivetran), so the company is the one
+// whose table_identifier the client starts with, and the flag waits only for
+// the dataset to hold any table rather than for a template's tables.
+const AMAZON_FLAG = { column: "amazon", value: true, unset: false, matchClientPrefix: true };
+
+function companyFlagFor(parent) {
+  return COMPANY_FLAGS[parent] || (parent.startsWith("amazon") ? AMAZON_FLAG : null);
+}
+
+// "acme_us_airbyte" -> ["acme", "acme_us", "acme_us_airbyte"]
+function clientPrefixes(client) {
+  const parts = client.split("_");
+  return parts.map((_, i) => parts.slice(0, i + 1).join("_")).filter(Boolean);
+}
+
+// Turns on the company setting for a new source, via Supabase's REST API.
+// Matches the company on `table_identifier` (the dataset's client part, or for
+// Amazon the longest table_identifier it starts with) and only writes when
+// exactly one company matches and the column is still unset.
+function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
+  const headers = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": "application/json",
+  };
+
+  // Each call is capped: this runs inside the Pub/Sub push request, and a hang
+  // past the ack deadline would make Pub/Sub redeliver and re-dispatch the scaffold.
+  async function request(path, init = {}) {
+    const resp = await fetchImpl(`${url}/rest/v1/${path}`, {
+      ...init,
+      headers: { ...headers, ...init.headers },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`Supabase ${init.method || "GET"} failed: ${resp.status} ${await resp.text()}`);
+    return resp.json();
+  }
+
+  return async function setCompanyFlag({ parent, client }) {
+    const flag = companyFlagFor(parent);
+    if (!flag) return { status: "no_flag" };
+    const { column, value, unset } = flag;
+
+    const match = flag.matchClientPrefix
+      ? `in.(${clientPrefixes(client).map(encodeURIComponent).join(",")})`
+      : `eq.${encodeURIComponent(client)}`;
+    const rows = await request(`companies?table_identifier=${match}&select=id,company_name,table_identifier,${column}`);
+    // Longest match wins, so acme_us_airbyte picks acme_us over acme.
+    const idOf = (r) => String(r.table_identifier ?? "");
+    const tableIdentifier = rows.reduce((best, r) => (idOf(r).length > best.length ? idOf(r) : best), "");
+    const companies = rows.filter((r) => idOf(r) === tableIdentifier);
+    if (companies.length !== 1) return { status: "company_not_unique", column, matches: companies.length };
+
+    const company = companies[0];
+    const current = company[column];
+    if (current !== null && current !== unset) return { status: "already_set", column, company: company.company_name, current };
+
+    // The unset filter is repeated in the update so a value someone set in the
+    // meantime is never overwritten.
+    const updated = await request(
+      `companies?id=eq.${company.id}&or=(${column}.is.null,${column}.eq.${unset})`,
+      { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ [column]: value }) }
+    );
+    if (!updated.length) return { status: "already_set", column, company: company.company_name };
+    return { status: "set", column, company: company.company_name, from: current, to: value };
+  };
+}
+
+// --- 4️⃣ GitHub dispatch helper ---
 async function dispatchToGitHub(payload) {
   const resp = await fetch(
     `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/dispatches`,
@@ -300,8 +422,14 @@ async function dispatchToGitHub(payload) {
   }
 }
 
-// --- 4️⃣ Express routes ---
-function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT_HOURS }) {
+// --- 5️⃣ Express routes ---
+function createApp({
+  bigquery,
+  dispatch,
+  setCompanyFlag = null,
+  now = Date.now,
+  maxWaitHours = MAX_WAIT_HOURS,
+}) {
   const app = express();
   app.use(express.json());
 
@@ -325,7 +453,10 @@ function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT
       });
 
       const plan = buildPlan(datasetId, PROJECT);
-      if (!plan) {
+      const parts = splitDataset(datasetId);
+      const flag = parts && companyFlagFor(parts.parent);
+      // amazon* datasets without a template still turn on the company setting.
+      if (!plan && !flag) {
         console.log("No matching template plan for:", datasetId);
         return res.status(204).end();
       }
@@ -335,31 +466,60 @@ function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT
       const createdAt = Date.parse(data?.timestamp || msg?.publishTime || "") || now();
       const waitedHours = Math.round(((now() - createdAt) / 3600000) * 10) / 10;
 
+      // A plan waits for its template's tables; the Amazon setting only for the
+      // dataset to hold any table.
       let missing = [];
+      let landed = false;
+      let tablesChecked = false;
       try {
-        missing = await findMissingTables(bigquery, plan.tables);
+        if (plan) missing = await findMissingTables(bigquery, plan.tables);
+        if (flag?.matchClientPrefix) landed = (await listTables(bigquery, datasetId)).size > 0;
+        tablesChecked = true;
       } catch (e) {
         // Can't check (e.g. no BigQuery permission): dispatch now, as before.
         console.error("TABLE_CHECK_FAILED", { datasetId, error: e.message });
       }
 
-      if (missing.length && waitedHours < maxWaitHours) {
+      const waiting = plan ? missing.length > 0 : tablesChecked && !landed;
+      if (waiting && waitedHours < maxWaitHours) {
         console.log("WAITING_FOR_TABLES", { datasetId, missing, waitedHours });
         // Any non-2xx response makes Pub/Sub redeliver the message later.
         return res.status(429).end();
       }
-      if (missing.length) {
-        console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
+
+      if (plan) {
+        const nothingLanded = tablesChecked && plan.tables.length > 0 && missing.length === plan.tables.length;
+        if (plan.requireSomeTables && nothingLanded) {
+          console.warn("NOT_DISPATCHING", { datasetId, reason: "none of the template's tables landed", missing, waitedHours });
+        } else {
+          if (missing.length) {
+            console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
+          }
+          await dispatch({
+            datasetId,
+            files: plan.files,
+            vars: plan.vars,
+            missingTables: missing,
+          });
+          console.log("✅ Dispatched to GitHub for", datasetId);
+        }
       }
 
-      await dispatch({
-        datasetId,
-        files: plan.files,
-        vars: plan.vars,
-        missingTables: missing,
-      });
+      // Only once the first sync has landed: a dataset still missing tables
+      // after the max wait points at a broken connector, not live data, and a
+      // failed table check proves nothing either way.
+      // Errors are logged, not returned, because a retry would re-dispatch.
+      if (setCompanyFlag && flag && !tablesChecked) {
+        console.log("COMPANY_FLAG_SKIPPED", { datasetId, status: "tables_unchecked" });
+      } else if (setCompanyFlag && flag && (flag.matchClientPrefix ? landed : !missing.length)) {
+        try {
+          const result = await setCompanyFlag({ parent: parts.parent, client: parts.client });
+          console.log(result.status === "set" ? "COMPANY_FLAG_SET" : "COMPANY_FLAG_SKIPPED", { datasetId, ...result });
+        } catch (e) {
+          console.error("COMPANY_FLAG_FAILED", { datasetId, error: e.message });
+        }
+      }
 
-      console.log("✅ Dispatched to GitHub for", datasetId);
       res.status(204).end();
     } catch (e) {
       console.error("Handler error:", e);
@@ -371,12 +531,18 @@ function createApp({ bigquery, dispatch, now = Date.now, maxWaitHours = MAX_WAIT
 }
 
 if (require.main === module) {
+  const setCompanyFlag =
+    SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+      ? createCompanyFlagSetter({ url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY })
+      : null;
+  if (!setCompanyFlag) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set");
   const app = createApp({
     bigquery: new BigQuery({ projectId: PROJECT }),
     dispatch: dispatchToGitHub,
+    setCompanyFlag,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
 }
 
-module.exports = { CATALOG, buildPlan, findMissingTables, createApp };
+module.exports = { CATALOG, COMPANY_FLAGS, buildPlan, findMissingTables, createCompanyFlagSetter, createApp };

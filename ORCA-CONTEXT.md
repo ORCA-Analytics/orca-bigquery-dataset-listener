@@ -60,8 +60,12 @@ curl http://localhost:8080/healthz
 | `GITHUB_TOKEN` | GitHub API token for repository dispatch to `orca-dbt` | Google Cloud Secret Manager (prod) or generate personal token with `repo` scope (local dev) |
 | `PORT` | HTTP server port (optional, defaults to `8080`) | Auto-set by Cloud Run, can override locally |
 | `MAX_WAIT_HOURS` | How long to wait for a new dataset's tables before dispatching anyway (optional, defaults to `72`) | Cloud Run service env var |
+| `SUPABASE_URL` | ORCA app Supabase project URL, for turning on company settings (optional) | Supabase project `orca_analytics` > Settings > API |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service-role key for that project (optional) | Google Cloud Secret Manager (prod); Supabase > Settings > API |
 
 The Cloud Run runtime service account needs `roles/bigquery.metadataViewer` on `orcaanalytics` to list tables (see Deployment). Without it the listener logs `TABLE_CHECK_FAILED` and dispatches immediately, as it did before table checks existed.
+
+Without both Supabase variables the listener logs `COMPANY_FLAGS_DISABLED` at startup and only dispatches scaffolds, as before.
 
 ## Folder Structure
 
@@ -101,7 +105,7 @@ flowchart LR
 ```
 
 - **Reads from:** Pub/Sub push messages containing BigQuery audit log entries (`protoPayload.resourceName`, `timestamp`), and BigQuery table listings for the datasets a scaffold reads
-- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint)
+- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint), and the ORCA app's Supabase `companies` table (one setting per new source, see Company settings)
 - **Triggered by:** GCP Pub/Sub push subscription (configured external to this repo)
 - **Depended on by:** `orca-dbt` repo GitHub Actions workflow expects `bq_dataset_created` event type with specific payload structure
 
@@ -124,8 +128,10 @@ flowchart LR
 ### Code Patterns
 
 - **Single-file service:** All logic in `server.js` (no modules/imports beyond Express)
-- **Catalog-driven logic:** `CATALOG` object maps parent dataset names to template entries. Each entry's `tables` lists the raw tables its orca-dbt template reads (`dataset.table`, with `{client}` filled in), which the listener waits for
+- **Catalog-driven logic:** `CATALOG` object maps parent dataset names to template entries. Each entry's `tables` lists the raw tables its orca-dbt template reads (`dataset.table`, with `{client}` filled in), which the listener waits for. `dataset.a|b` is satisfied by either table, for loaders that name a table differently (Seller Central: Airbyte `GET_SALES_AND_TRAFFIC_REPORT`/`Orders`, Fivetran `sales_and_traffic_business_report_daily`/`orders`)
+- **Amazon:** `amazon_ads__<client>` scaffolds the Amazon Ads model and `amazon_sellercentral__<client>` the three Seller Central models (sales, cohorts, new/return), both under orca-dbt's `templates/amazon/`. The client part often carries a loader suffix (`acme_airbyte`, `acme_us_fivetran`); the scaffold keeps it, as for every platform, so the models read the right dataset. Both entries set `requireSomeTables`: a dataset holding none of the template's tables after `MAX_WAIT_HOURS` (fulfillments-only `..._airbyte_fulfillments`, Fivetran dbt-package outputs like `amazon_ads__acme_amazon_ads_source`) is logged as `NOT_DISPATCHING` instead of scaffolded. The dispatch sends `vars.parent` = `amazon_ads` / `amazon_sellercentral`, so orca-dbt needs `templates/sources/amazon_ads.yml` and `templates/sources/amazon_sellercentral.yml`
 - **Waiting via Pub/Sub redelivery:** while tables are missing (and the dataset is younger than `MAX_WAIT_HOURS`), the handler returns 429, so Pub/Sub redelivers the message later; no state is stored. After the max wait it dispatches anyway and includes `missingTables` in the payload
+- **Company settings:** after a dispatch whose tables were checked and all exist (not after `TABLE_CHECK_FAILED`), `COMPANY_FLAGS` maps the parent to the `companies` column the ORCA app reads (e.g. `fairing` → `hdyhau = 'Fairing'`, `google_ads` → `google_ads = true`) and `createCompanyFlagSetter()` writes it through Supabase's REST API. It matches the company on `table_identifier = client` (for Amazon: any `amazon*` dataset, including ones without a template such as `amazong_ads__acme`, turns on `amazon` for the longest `table_identifier` the client starts with, so `acme_us_airbyte` finds `acme_us`; it waits only for the dataset to hold any table, not for a template's tables), skips unless exactly one company matches, and only replaces the unset value (`'none'`/`false`/null), with that filter repeated in the update itself. It logs `COMPANY_FLAG_SET`, `COMPANY_FLAG_SKIPPED` (with the reason) or `COMPANY_FLAG_FAILED`; a failure never fails the message, because a redelivery would dispatch the scaffold again. Each Supabase call times out after 5 seconds for the same reason: a hang past the Pub/Sub ack deadline would also redeliver. New datasets only: brands connected before this shipped aren't backfilled
 - **Custom output functions:** Some catalog entries use `out: (tpl, client) => filename` for non-standard naming
 - **Graceful skips:** Returns HTTP 204 (no content) when dataset doesn't match catalog (not an error)
 - **Error handling:** Try/catch on main handler, logs to stdout, returns 500 on dispatch failures
@@ -198,6 +204,26 @@ gcloud pubsub subscriptions describe SUBSCRIPTION \
 ```
 
 Retention must exceed `MAX_WAIT_HOURS` (the 7-day default does). A dead-letter policy stops redelivery after `maxDeliveryAttempts` (at most 100, roughly 16 hours at a 10-minute retry delay): either remove it or set `MAX_WAIT_HOURS` below that.
+
+### One-time setup for company settings
+
+Do these before merging (merging deploys). Until both variables are set, the listener skips company settings and logs `COMPANY_FLAGS_DISABLED` at startup.
+
+```bash
+# 1. Store the service-role key (Supabase > Project Settings > API > service_role)
+printf '%s' "$SUPABASE_SERVICE_ROLE_KEY" | gcloud secrets create supabase-service-role-key --data-file=-
+
+# 2. Let the Cloud Run service account read it ($SA as in step 1 above)
+gcloud secrets add-iam-policy-binding supabase-service-role-key \
+  --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
+
+# 3. Add both variables to the service (kept across Cloud Build deploys)
+gcloud run services update orca-bigquery-dataset-listener --region us-central1 \
+  --update-env-vars SUPABASE_URL=https://sscfogzzbwlgpqcnnfjx.supabase.co \
+  --update-secrets SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest
+```
+
+After the next new source lands, check the logs for `COMPANY_FLAG_SET` / `COMPANY_FLAG_SKIPPED`.
 
 ### How to Deploy
 

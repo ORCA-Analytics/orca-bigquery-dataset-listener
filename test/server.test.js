@@ -149,6 +149,18 @@ test("leaves company settings alone when dispatching with missing tables", async
   assert.equal(calls.length, 0);
 });
 
+test("leaves company settings alone when the table check itself failed", async () => {
+  const calls = [];
+  const denied = Object.assign(new Error("Access Denied"), { code: 403 });
+  const { app, dispatched } = setup(
+    { error: denied },
+    { setCompanyFlag: async (args) => (calls.push(args), { status: "set" }) }
+  );
+  assert.equal(await deliver(app, pubsubBody("fairing__acme", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(calls.length, 0);
+});
+
 test("a failed company update doesn't fail the message (a retry would re-dispatch)", async () => {
   const { app, dispatched } = setup(
     { datasets: { fairing__acme: ["responses"] } },
@@ -217,6 +229,21 @@ test("does nothing for sources without a company setting", async () => {
   const { setCompanyFlag, requests } = fakeSupabase();
   assert.deepEqual(await setCompanyFlag({ parent: "shopify", client: "acme" }), { status: "no_flag" });
   assert.equal(requests.length, 0);
+});
+
+test("gives up on a Supabase call that hangs", async () => {
+  const setCompanyFlag = createCompanyFlagSetter({
+    url: "https://sb.test",
+    serviceRoleKey: "key",
+    timeoutMs: 20,
+    // Never answers; the long timer keeps the event loop alive like an open socket.
+    fetchImpl: (_url, init) =>
+      new Promise((_resolve, reject) => {
+        const socket = setTimeout(() => {}, 10000);
+        init.signal.addEventListener("abort", () => (clearTimeout(socket), reject(init.signal.reason)));
+      }),
+  });
+  await assert.rejects(setCompanyFlag({ parent: "fairing", client: "acme" }), { name: "TimeoutError" });
 });
 
 test("throws on a Supabase error so the caller logs it", async () => {

@@ -299,15 +299,21 @@ const COMPANY_FLAGS = {
 // Turns on the company setting for a new source, via Supabase's REST API.
 // Matches the company on `table_identifier` (the dataset's client part) and
 // only writes when exactly one company matches and the column is still unset.
-function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch }) {
+function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
   const headers = {
     apikey: serviceRoleKey,
     Authorization: `Bearer ${serviceRoleKey}`,
     "Content-Type": "application/json",
   };
 
+  // Each call is capped: this runs inside the Pub/Sub push request, and a hang
+  // past the ack deadline would make Pub/Sub redeliver and re-dispatch the scaffold.
   async function request(path, init = {}) {
-    const resp = await fetchImpl(`${url}/rest/v1/${path}`, { ...init, headers: { ...headers, ...init.headers } });
+    const resp = await fetchImpl(`${url}/rest/v1/${path}`, {
+      ...init,
+      headers: { ...headers, ...init.headers },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!resp.ok) throw new Error(`Supabase ${init.method || "GET"} failed: ${resp.status} ${await resp.text()}`);
     return resp.json();
   }
@@ -404,8 +410,10 @@ function createApp({
       const waitedHours = Math.round(((now() - createdAt) / 3600000) * 10) / 10;
 
       let missing = [];
+      let tablesChecked = false;
       try {
         missing = await findMissingTables(bigquery, plan.tables);
+        tablesChecked = true;
       } catch (e) {
         // Can't check (e.g. no BigQuery permission): dispatch now, as before.
         console.error("TABLE_CHECK_FAILED", { datasetId, error: e.message });
@@ -430,9 +438,12 @@ function createApp({
       console.log("✅ Dispatched to GitHub for", datasetId);
 
       // Only once the first sync has landed: a dataset still missing tables
-      // after the max wait points at a broken connector, not live data.
+      // after the max wait points at a broken connector, not live data, and a
+      // failed table check proves nothing either way.
       // Errors are logged, not returned, because a retry would re-dispatch.
-      if (setCompanyFlag && !missing.length) {
+      if (setCompanyFlag && !tablesChecked) {
+        console.log("COMPANY_FLAG_SKIPPED", { datasetId, status: "tables_unchecked" });
+      } else if (setCompanyFlag && !missing.length) {
         try {
           const result = await setCompanyFlag({ parent: plan.vars.parent, client: plan.vars.client });
           const event = result.status === "set" ? "COMPANY_FLAG_SET" : "COMPANY_FLAG_SKIPPED";

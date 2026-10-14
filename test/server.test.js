@@ -358,3 +358,10 @@ test("throws on a Supabase error so the caller logs it", async () => {
   });
   await assert.rejects(setCompanyFlag({ parent: "fairing", client: "acme" }), /401 bad key/);
 });
+
+test("google_ads plan scaffolds the searchterms model from custom_searchterms", () => {
+  const plan = buildPlan("google_ads__acme", "orcaanalytics");
+  const file = plan.files.find((f) => f.path === "models/google_ads/searchterms/google_ads_searchterms__acme.sql");
+  assert.ok(file, "searchterms model missing from plan");
+  assert.equal(file.template, "templates/google_ads/searchterms/google_ads_searchterms.sql");
+});

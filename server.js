@@ -58,6 +58,7 @@ const CATALOG = {
       { rel: "campaigns", tpl: "google_ads", tables: ["google_ads__{client}.custom_campaign"] },
       { rel: "keywords", tpl: "google_ads_keywords", tables: ["google_ads__{client}.custom_keyword"] },
       { rel: "products", tpl: "google_ads_products", tables: ["google_ads__{client}.custom_shopping"] },
+      { rel: "searchterms", tpl: "google_ads_searchterms", tables: ["google_ads__{client}.custom_searchterms"] },
     ],
   },
   google_analytics_4: {

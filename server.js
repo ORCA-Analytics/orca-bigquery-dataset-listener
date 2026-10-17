@@ -3,7 +3,9 @@ const express = require("express");
 const { BigQuery } = require("@google-cloud/bigquery");
 
 // --- Environment variables ---
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // stored in Secret Manager
+// Stored in Secret Manager; trimmed because a pasted trailing newline makes
+// every dispatch fail with an invalid Authorization header.
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 const GH_OWNER = "ORCA-Analytics";
 const GH_REPO = "orca-dbt";
 const PROJECT = "orcaanalytics";
@@ -37,6 +39,10 @@ function oPath(baseDir, rel, name) {
 // suffixes after the client (amazon_sellercentral__acme_airbyte_fulfillments,
 // Fivetran dbt-package outputs like amazon_ads__acme_amazon_ads_source) and
 // only some of them are the raw source a template reads.
+//
+// `optional` entries read a table that most connections don't sync. They don't
+// hold up the dispatch: the file is scaffolded only when all of its tables
+// already exist at dispatch time.
 const CATALOG = {
   facebook_ads: {
     entries: [
@@ -58,7 +64,13 @@ const CATALOG = {
       { rel: "campaigns", tpl: "google_ads", tables: ["google_ads__{client}.custom_campaign"] },
       { rel: "keywords", tpl: "google_ads_keywords", tables: ["google_ads__{client}.custom_keyword"] },
       { rel: "products", tpl: "google_ads_products", tables: ["google_ads__{client}.custom_shopping"] },
-      { rel: "searchterms", tpl: "google_ads_searchterms", tables: ["google_ads__{client}.custom_searchterms"] },
+      // Only a few connections sync the custom_searchterms query.
+      {
+        rel: "searchterms",
+        tpl: "google_ads_searchterms",
+        tables: ["google_ads__{client}.custom_searchterms"],
+        optional: true,
+      },
     ],
   },
   google_analytics_4: {
@@ -264,15 +276,23 @@ function buildPlan(datasetId, projectId) {
   const baseDir = cfg.dir || parent; // <— use alias if provided
   const files = [];
   const tables = new Set();
+  const optional = [];
   for (const e of cfg.entries) {
     const template = tPath(baseDir, e.rel, e.tpl);
     const outName = e.out ? e.out(e.tpl, client) : `${e.tpl}__${client}.sql`;
-    files.push({ template, path: oPath(baseDir, e.rel, outName) });
-    for (const t of e.tables || []) tables.add(t.replace("{client}", client));
+    const file = { template, path: oPath(baseDir, e.rel, outName) };
+    const entryTables = (e.tables || []).map((t) => t.replace("{client}", client));
+    if (e.optional) {
+      optional.push({ file, tables: entryTables });
+      continue;
+    }
+    files.push(file);
+    for (const t of entryTables) tables.add(t);
   }
   return {
     files,
     tables: [...tables],
+    optional,
     requireSomeTables: Boolean(cfg.requireSomeTables),
     vars: { datasetId, parent, client, project: projectId },
   };
@@ -470,10 +490,16 @@ function createApp({
       // A plan waits for its template's tables; the Amazon setting only for the
       // dataset to hold any table.
       let missing = [];
+      let absent = new Set(); // optional entries' tables included
       let landed = false;
       let tablesChecked = false;
       try {
-        if (plan) missing = await findMissingTables(bigquery, plan.tables);
+        if (plan) {
+          absent = new Set(
+            await findMissingTables(bigquery, [...plan.tables, ...plan.optional.flatMap((o) => o.tables)])
+          );
+          missing = plan.tables.filter((t) => absent.has(t));
+        }
         if (flag?.matchClientPrefix) landed = (await listTables(bigquery, datasetId)).size > 0;
         tablesChecked = true;
       } catch (e) {
@@ -496,9 +522,15 @@ function createApp({
           if (missing.length) {
             console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
           }
+          const files = [...plan.files];
+          for (const o of plan.optional) {
+            const notThere = o.tables.filter((t) => absent.has(t));
+            if (notThere.length) console.log("SKIPPING_OPTIONAL_MODEL", { datasetId, path: o.file.path, missing: notThere });
+            else files.push(o.file);
+          }
           await dispatch({
             datasetId,
-            files: plan.files,
+            files,
             vars: plan.vars,
             missingTables: missing,
           });

@@ -359,9 +359,39 @@ test("throws on a Supabase error so the caller logs it", async () => {
   await assert.rejects(setCompanyFlag({ parent: "fairing", client: "acme" }), /401 bad key/);
 });
 
-test("google_ads plan scaffolds the searchterms model from custom_searchterms", () => {
+// --- Optional entries (Google Ads search terms) ---
+
+const SEARCHTERMS = {
+  template: "templates/google_ads/searchterms/google_ads_searchterms.sql",
+  path: "models/google_ads/searchterms/google_ads_searchterms__acme.sql",
+};
+const GOOGLE_ADS_TABLES = ["custom_campaign", "custom_keyword", "custom_shopping"];
+
+test("google_ads plan scaffolds the searchterms model only as an optional file", () => {
   const plan = buildPlan("google_ads__acme", "orcaanalytics");
-  const file = plan.files.find((f) => f.path === "models/google_ads/searchterms/google_ads_searchterms__acme.sql");
-  assert.ok(file, "searchterms model missing from plan");
-  assert.equal(file.template, "templates/google_ads/searchterms/google_ads_searchterms.sql");
+  assert.deepEqual(plan.optional, [{ file: SEARCHTERMS, tables: ["google_ads__acme.custom_searchterms"] }]);
+  assert.ok(!plan.files.some((f) => f.path === SEARCHTERMS.path));
+  assert.ok(!plan.tables.includes("google_ads__acme.custom_searchterms"));
+});
+
+test("doesn't wait for custom_searchterms, and leaves its model out when the table isn't there", async () => {
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: GOOGLE_ADS_TABLES } });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].missingTables, []);
+  assert.deepEqual(dispatched[0].files, buildPlan("google_ads__acme", "orcaanalytics").files);
+});
+
+test("scaffolds the searchterms model when custom_searchterms has landed", async () => {
+  const { app, dispatched } = setup({
+    datasets: { google_ads__acme: [...GOOGLE_ADS_TABLES, "custom_searchterms"] },
+  });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 204);
+  assert.deepEqual(dispatched[0].files, [...buildPlan("google_ads__acme", "orcaanalytics").files, SEARCHTERMS]);
+});
+
+test("still waits for the required Google Ads tables", async () => {
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms"] } });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 429);
+  assert.equal(dispatched.length, 0);
 });

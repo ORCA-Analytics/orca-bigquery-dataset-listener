@@ -367,22 +367,28 @@ const SEARCHTERMS = {
 };
 const GOOGLE_ADS_TABLES = ["custom_campaign", "custom_keyword", "custom_shopping"];
 
-test("google_ads plan scaffolds the searchterms model only as an optional file", () => {
+test("google_ads plan scaffolds the searchterms model as an optional file it waits a day for", () => {
   const plan = buildPlan("google_ads__acme", "orcaanalytics");
-  assert.deepEqual(plan.optional, [{ file: SEARCHTERMS, tables: ["google_ads__acme.custom_searchterms"] }]);
+  assert.deepEqual(plan.optional, [{ file: SEARCHTERMS, tables: ["google_ads__acme.custom_searchterms"], waitHours: 24 }]);
   assert.ok(!plan.files.some((f) => f.path === SEARCHTERMS.path));
   assert.ok(!plan.tables.includes("google_ads__acme.custom_searchterms"));
 });
 
-test("doesn't wait for custom_searchterms, and leaves its model out when the table isn't there", async () => {
+test("waits for custom_searchterms during its first day", async () => {
   const { app, dispatched } = setup({ datasets: { google_ads__acme: GOOGLE_ADS_TABLES } });
-  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 204);
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 23 * HOUR)), 429);
+  assert.equal(dispatched.length, 0);
+});
+
+test("after a day without custom_searchterms, dispatches without its model", async () => {
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: GOOGLE_ADS_TABLES } });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 25 * HOUR)), 204);
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].missingTables, []);
   assert.deepEqual(dispatched[0].files, buildPlan("google_ads__acme", "orcaanalytics").files);
 });
 
-test("scaffolds the searchterms model when custom_searchterms has landed", async () => {
+test("an empty custom_searchterms (e.g. a Performance Max-only account) still counts as landed", async () => {
   const { app, dispatched } = setup({
     datasets: { google_ads__acme: [...GOOGLE_ADS_TABLES, "custom_searchterms"] },
   });
@@ -393,5 +399,11 @@ test("scaffolds the searchterms model when custom_searchterms has landed", async
 test("still waits for the required Google Ads tables", async () => {
   const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms"] } });
   assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 429);
+  assert.equal(dispatched.length, 0);
+});
+
+test("keeps waiting for the required Google Ads tables after the searchterms day", async () => {
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms"] } });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 30 * HOUR)), 429);
   assert.equal(dispatched.length, 0);
 });

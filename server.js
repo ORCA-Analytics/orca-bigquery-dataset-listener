@@ -42,7 +42,9 @@ function oPath(baseDir, rel, name) {
 //
 // `optional` entries read a table that most connections don't sync. They don't
 // hold up the dispatch: the file is scaffolded only when all of its tables
-// already exist at dispatch time.
+// already exist at dispatch time. With `waitHours`, a missing optional table
+// holds the dispatch until the dataset is that old (capped by the max wait),
+// for tables a separate connection is expected to land but may never do.
 const CATALOG = {
   facebook_ads: {
     entries: [
@@ -64,12 +66,16 @@ const CATALOG = {
       { rel: "campaigns", tpl: "google_ads", tables: ["google_ads__{client}.custom_campaign"] },
       { rel: "keywords", tpl: "google_ads_keywords", tables: ["google_ads__{client}.custom_keyword"] },
       { rel: "products", tpl: "google_ads_products", tables: ["google_ads__{client}.custom_shopping"] },
-      // Only a few connections sync the custom_searchterms query.
+      // New clients get custom_searchterms and custom_pmax_searchterms from a
+      // separate `_searchterms` connection; older connections never sync them,
+      // and one with a failed OAuth never lands them, so the other models
+      // don't wait past a day.
       {
         rel: "searchterms",
         tpl: "google_ads_searchterms",
-        tables: ["google_ads__{client}.custom_searchterms"],
+        tables: ["google_ads__{client}.custom_searchterms", "google_ads__{client}.custom_pmax_searchterms"],
         optional: true,
+        waitHours: 24,
       },
     ],
   },
@@ -283,7 +289,7 @@ function buildPlan(datasetId, projectId) {
     const file = { template, path: oPath(baseDir, e.rel, outName) };
     const entryTables = (e.tables || []).map((t) => t.replace("{client}", client));
     if (e.optional) {
-      optional.push({ file, tables: entryTables });
+      optional.push({ file, tables: entryTables, waitHours: e.waitHours || 0 });
       continue;
     }
     files.push(file);
@@ -507,9 +513,14 @@ function createApp({
         console.error("TABLE_CHECK_FAILED", { datasetId, error: e.message });
       }
 
-      const waiting = plan ? missing.length > 0 : tablesChecked && !landed;
+      const awaitedOptional = plan
+        ? plan.optional
+            .filter((o) => waitedHours < o.waitHours)
+            .flatMap((o) => o.tables.filter((t) => absent.has(t)))
+        : [];
+      const waiting = plan ? missing.length > 0 || awaitedOptional.length > 0 : tablesChecked && !landed;
       if (waiting && waitedHours < maxWaitHours) {
-        console.log("WAITING_FOR_TABLES", { datasetId, missing, waitedHours });
+        console.log("WAITING_FOR_TABLES", { datasetId, missing: [...missing, ...awaitedOptional], waitedHours });
         // Any non-2xx response makes Pub/Sub redeliver the message later.
         return res.status(429).end();
       }

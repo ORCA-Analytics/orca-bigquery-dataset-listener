@@ -369,7 +369,7 @@ const GOOGLE_ADS_TABLES = ["custom_campaign", "custom_keyword", "custom_shopping
 
 test("google_ads plan scaffolds the searchterms model as an optional file it waits a day for", () => {
   const plan = buildPlan("google_ads__acme", "orcaanalytics");
-  assert.deepEqual(plan.optional, [{ file: SEARCHTERMS, tables: ["google_ads__acme.custom_searchterms"], waitHours: 24 }]);
+  assert.deepEqual(plan.optional, [{ file: SEARCHTERMS, tables: ["google_ads__acme.custom_searchterms", "google_ads__acme.custom_pmax_searchterms"], waitHours: 24 }]);
   assert.ok(!plan.files.some((f) => f.path === SEARCHTERMS.path));
   assert.ok(!plan.tables.includes("google_ads__acme.custom_searchterms"));
 });
@@ -388,22 +388,29 @@ test("after a day without custom_searchterms, dispatches without its model", asy
   assert.deepEqual(dispatched[0].files, buildPlan("google_ads__acme", "orcaanalytics").files);
 });
 
-test("an empty custom_searchterms (e.g. a Performance Max-only account) still counts as landed", async () => {
+test("empty search-term tables (e.g. no Search/Shopping or no PMax campaigns) still count as landed", async () => {
   const { app, dispatched } = setup({
-    datasets: { google_ads__acme: [...GOOGLE_ADS_TABLES, "custom_searchterms"] },
+    datasets: { google_ads__acme: [...GOOGLE_ADS_TABLES, "custom_searchterms", "custom_pmax_searchterms"] },
   });
   assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 204);
   assert.deepEqual(dispatched[0].files, [...buildPlan("google_ads__acme", "orcaanalytics").files, SEARCHTERMS]);
 });
 
+test("an older connection with only custom_searchterms skips the model after a day (template needs both)", async () => {
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: [...GOOGLE_ADS_TABLES, "custom_searchterms"] } });
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 429);
+  assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 25 * HOUR)), 204);
+  assert.deepEqual(dispatched[0].files, buildPlan("google_ads__acme", "orcaanalytics").files);
+});
+
 test("still waits for the required Google Ads tables", async () => {
-  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms"] } });
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms", "custom_pmax_searchterms"] } });
   assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - HOUR)), 429);
   assert.equal(dispatched.length, 0);
 });
 
 test("keeps waiting for the required Google Ads tables after the searchterms day", async () => {
-  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms"] } });
+  const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms", "custom_pmax_searchterms"] } });
   assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 30 * HOUR)), 429);
   assert.equal(dispatched.length, 0);
 });

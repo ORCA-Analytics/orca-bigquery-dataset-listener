@@ -66,13 +66,14 @@ const CATALOG = {
       { rel: "campaigns", tpl: "google_ads", tables: ["google_ads__{client}.custom_campaign"] },
       { rel: "keywords", tpl: "google_ads_keywords", tables: ["google_ads__{client}.custom_keyword"] },
       { rel: "products", tpl: "google_ads_products", tables: ["google_ads__{client}.custom_shopping"] },
-      // New clients get custom_searchterms from a separate `_searchterms`
-      // connection; older connections never sync it, and one with a failed
-      // OAuth never lands it, so the other models don't wait past a day.
+      // New clients get custom_searchterms and custom_pmax_searchterms from a
+      // separate `_searchterms` connection; older connections never sync them,
+      // and one with a failed OAuth never lands them, so the other models
+      // don't wait past a day.
       {
         rel: "searchterms",
         tpl: "google_ads_searchterms",
-        tables: ["google_ads__{client}.custom_searchterms"],
+        tables: ["google_ads__{client}.custom_searchterms", "google_ads__{client}.custom_pmax_searchterms"],
         optional: true,
         waitHours: 24,
       },

@@ -152,6 +152,11 @@ const CATALOG = {
         tpl: "shopify_customervisits",
         tables: ["shopify__{client}.customer_journey_summary"],
       },
+      {
+        rel: "shopify_pixel/lasttouch_daily",
+        tpl: "shopify_lasttouch_daily",
+        tables: ["shopify__{client}.customer_journey_summary"],
+      },
       { rel: "shopify_pixel/daily_channel", tpl: "shopify_pixel_dailychannel" },
       { rel: "shopify_pixel/extrapolated", tpl: "shopify_pixel_extrapolated" },
       { rel: "shopify_pixel/modeled", tpl: "shopify_pixel_modeled" },

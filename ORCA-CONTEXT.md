@@ -62,10 +62,14 @@ curl http://localhost:8080/healthz
 | `MAX_WAIT_HOURS` | How long to wait for a new dataset's tables before dispatching anyway (optional, defaults to `72`) | Cloud Run service env var |
 | `SUPABASE_URL` | ORCA app Supabase project URL, for turning on company settings (optional) | Supabase project `orca_analytics` > Settings > API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role key for that project (optional) | Google Cloud Secret Manager (prod); Supabase > Settings > API |
+| `SUPABASE_SOURCE_DATASET_URL` | URL of the ORCA app's `source-dataset-created` edge function, pinged after each dispatch (optional) | `https://sscfogzzbwlgpqcnnfjx.supabase.co/functions/v1/source-dataset-created` |
+| `SOURCE_DATASET_SECRET` | Shared secret sent as `x-orca-source-secret` to that function (optional) | Google Cloud Secret Manager (prod); the same value the edge function checks |
 
 The Cloud Run runtime service account needs `roles/bigquery.metadataViewer` on `orcaanalytics` to list tables (see Deployment). Without it the listener logs `TABLE_CHECK_FAILED` and dispatches immediately, as it did before table checks existed.
 
 Without both Supabase variables the listener logs `COMPANY_FLAGS_DISABLED` at startup and only dispatches scaffolds, as before.
+
+Without both source dataset variables the listener logs `SOURCE_DATASET_PING_SKIPPED` after each dispatch instead of pinging.
 
 ## Folder Structure
 
@@ -88,6 +92,7 @@ orca-bigquery-dataset-listener/
   - `buildPlan()` - matches dataset against catalog and generates file plan, plus the tables to wait for
   - `findMissingTables()` - lists which of those tables don't exist yet
   - `dispatchToGitHub()` - sends repository dispatch event
+  - `createSourceDatasetNotifier()` - tells the ORCA app's `source-dataset-created` edge function a dataset landed
 - **API routes:**
   - `GET /healthz` - health check (returns `200 ok`)
   - `POST /` - Pub/Sub push endpoint (receives base64-encoded audit log events)
@@ -102,10 +107,12 @@ flowchart LR
     Listener --> GitHubAPI[GitHub API]
     GitHubAPI --> DBTRepo[orca-dbt repo workflow]
     DBTRepo --> NewFiles[Client-specific SQL models]
+    Listener --> EdgeFn[Supabase edge function source-dataset-created]
+    EdgeFn --> Checklist[ORCA app onboarding checklist]
 ```
 
 - **Reads from:** Pub/Sub push messages containing BigQuery audit log entries (`protoPayload.resourceName`, `timestamp`), and BigQuery table listings for the datasets a scaffold reads
-- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint), and the ORCA app's Supabase `companies` table (one setting per new source, see Company settings)
+- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint), the ORCA app's Supabase `companies` table (one setting per new source, see Company settings), and the ORCA app's `source-dataset-created` edge function (see Source dataset ping)
 - **Triggered by:** GCP Pub/Sub push subscription (configured external to this repo)
 - **Depended on by:** `orca-dbt` repo GitHub Actions workflow expects `bq_dataset_created` event type with specific payload structure
 
@@ -133,6 +140,7 @@ flowchart LR
 - **Amazon:** `amazon_ads__<client>` scaffolds the Amazon Ads model and `amazon_sellercentral__<client>` the three Seller Central models (sales, cohorts, new/return), both under orca-dbt's `templates/amazon/`. The client part often carries a loader suffix (`acme_airbyte`, `acme_us_fivetran`); the scaffold keeps it, as for every platform, so the models read the right dataset. Both entries set `requireSomeTables`: a dataset holding none of the template's tables after `MAX_WAIT_HOURS` (fulfillments-only `..._airbyte_fulfillments`, Fivetran dbt-package outputs like `amazon_ads__acme_amazon_ads_source`) is logged as `NOT_DISPATCHING` instead of scaffolded. The dispatch sends `vars.parent` = `amazon_ads` / `amazon_sellercentral`, so orca-dbt needs `templates/sources/amazon_ads.yml` and `templates/sources/amazon_sellercentral.yml`
 - **Waiting via Pub/Sub redelivery:** while tables are missing (and the dataset is younger than `MAX_WAIT_HOURS`), the handler returns 429, so Pub/Sub redelivers the message later; no state is stored. After the max wait it dispatches anyway and includes `missingTables` in the payload
 - **Company settings:** after a dispatch whose tables were checked and all exist (not after `TABLE_CHECK_FAILED`), `COMPANY_FLAGS` maps the parent to the `companies` column the ORCA app reads (e.g. `fairing` → `hdyhau = 'Fairing'`, `google_ads` → `google_ads = true`) and `createCompanyFlagSetter()` writes it through Supabase's REST API. It matches the company on `table_identifier = client` (for Amazon: any `amazon*` dataset, including ones without a template such as `amazong_ads__acme`, turns on `amazon` for the longest `table_identifier` the client starts with, so `acme_us_airbyte` finds `acme_us`; it waits only for the dataset to hold any table, not for a template's tables), skips unless exactly one company matches, and only replaces the unset value (`'none'`/`false`/null), with that filter repeated in the update itself. It logs `COMPANY_FLAG_SET`, `COMPANY_FLAG_SKIPPED` (with the reason) or `COMPANY_FLAG_FAILED`; a failure never fails the message, because a redelivery would dispatch the scaffold again. Each Supabase call times out after 5 seconds for the same reason: a hang past the Pub/Sub ack deadline would also redeliver. New datasets only: brands connected before this shipped aren't backfilled
+- **Source dataset ping (ENG-263):** after every successful GitHub dispatch, `createSourceDatasetNotifier()` POSTs `{"dataset_id": "<parent>__<client>"}` to `SUPABASE_SOURCE_DATASET_URL` with header `x-orca-source-secret: $SOURCE_DATASET_SECRET`. The ORCA app's `source-dataset-created` edge function (ENG-262) uses it to tick the source on the brand's onboarding checklist. It runs under the same condition as the dispatch: no ping for a dataset without a template, one still waiting for tables, one logged `NOT_DISPATCHING`, an `amazon*` dataset that only turns on the company setting, or a failed dispatch. It does ping a dataset dispatched with `missingTables` after `MAX_WAIT_HOURS` or after `TABLE_CHECK_FAILED`. It authenticates with the shared secret only and sends no `Authorization` header, so the edge function must be deployed with JWT verification off (`--no-verify-jwt`), or every ping fails with a 401 from Supabase's gateway. It logs `SOURCE_DATASET_PINGED`, `SOURCE_DATASET_PING_FAILED` (non-2xx, network error, or the 5-second timeout) or `SOURCE_DATASET_PING_SKIPPED` (variables not set). A failure never fails the message, for the same reason as the company setting: a redelivery would dispatch the scaffold again. The secret is never logged
 - **Custom output functions:** Some catalog entries use `out: (tpl, client) => filename` for non-standard naming
 - **Graceful skips:** Returns HTTP 204 (no content) when dataset doesn't match catalog (not an error)
 - **Error handling:** Try/catch on main handler, logs to stdout, returns 500 on dispatch failures
@@ -226,6 +234,26 @@ gcloud run services update orca-bigquery-dataset-listener --region us-central1 \
 ```
 
 After the next new source lands, check the logs for `COMPANY_FLAG_SET` / `COMPANY_FLAG_SKIPPED`.
+
+### One-time setup for the source dataset ping
+
+Do this once the `source-dataset-created` edge function (ENG-262) is live, deployed with `--no-verify-jwt`. Merging first is safe: until both variables are set, the listener logs `SOURCE_DATASET_PING_SKIPPED` after each dispatch.
+
+```bash
+# 1. Store the shared secret (the same value the edge function checks)
+printf '%s' "$SOURCE_DATASET_SECRET" | gcloud secrets create source-dataset-secret --data-file=-
+
+# 2. Let the Cloud Run service account read it ($SA as in the table-check setup above)
+gcloud secrets add-iam-policy-binding source-dataset-secret \
+  --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
+
+# 3. Add both variables to the service (kept across Cloud Build deploys; starts a new revision)
+gcloud run services update orca-bigquery-dataset-listener --region us-central1 \
+  --update-env-vars SUPABASE_SOURCE_DATASET_URL=https://sscfogzzbwlgpqcnnfjx.supabase.co/functions/v1/source-dataset-created \
+  --update-secrets SOURCE_DATASET_SECRET=source-dataset-secret:latest
+```
+
+After the next new source lands, check the logs for `SOURCE_DATASET_PINGED`. Datasets that landed before then aren't backfilled.
 
 ### How to Deploy
 

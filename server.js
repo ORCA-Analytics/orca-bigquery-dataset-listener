@@ -14,6 +14,11 @@ const MAX_WAIT_HOURS = Number(process.env.MAX_WAIT_HOURS || 72);
 // Supabase project with the `companies` table the ORCA app reads its settings from.
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // stored in Secret Manager
+// The ORCA app's `source-dataset-created` edge function and the shared secret
+// it checks (not the service-role key). Trimmed like GITHUB_TOKEN: a trailing
+// newline is an invalid header value.
+const SUPABASE_SOURCE_DATASET_URL = (process.env.SUPABASE_SOURCE_DATASET_URL || "").trim();
+const SOURCE_DATASET_SECRET = (process.env.SOURCE_DATASET_SECRET || "").trim(); // stored in Secret Manager
 
 // --- 1️⃣ buildPlan logic ---
 function splitDataset(datasetId) {
@@ -454,11 +459,29 @@ async function dispatchToGitHub(payload) {
   }
 }
 
-// --- 5️⃣ Express routes ---
+// --- 5️⃣ Source dataset ping ---
+// Tells the ORCA app a brand's source dataset landed, so its onboarding
+// checklist can tick that source as connected. Capped like the company flag
+// calls: a hang past the Pub/Sub ack deadline would redeliver and re-dispatch.
+function createSourceDatasetNotifier({ url, secret, fetchImpl = fetch, timeoutMs = 5000 }) {
+  return async function notifySourceDataset(datasetId) {
+    const resp = await fetchImpl(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-orca-source-secret": secret },
+      body: JSON.stringify({ dataset_id: datasetId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`source-dataset-created failed: ${resp.status} ${await resp.text()}`);
+    return resp.status;
+  };
+}
+
+// --- 6️⃣ Express routes ---
 function createApp({
   bigquery,
   dispatch,
   setCompanyFlag = null,
+  notifySourceDataset = null,
   now = Date.now,
   maxWaitHours = MAX_WAIT_HOURS,
 }) {
@@ -551,6 +574,19 @@ function createApp({
             missingTables: missing,
           });
           console.log("✅ Dispatched to GitHub for", datasetId);
+
+          // Errors are logged, not returned, because a retry would re-dispatch.
+          if (!notifySourceDataset) {
+            console.log("SOURCE_DATASET_PING_SKIPPED", { datasetId, reason: "SUPABASE_SOURCE_DATASET_URL or SOURCE_DATASET_SECRET not set" });
+          } else {
+            try {
+              const status = await notifySourceDataset(datasetId);
+              console.log("SOURCE_DATASET_PINGED", { datasetId, status });
+            } catch (e) {
+              // fetch's own message is just "fetch failed"; the cause says why.
+              console.error("SOURCE_DATASET_PING_FAILED", { datasetId, error: e.message, cause: e.cause?.message });
+            }
+          }
         }
       }
 
@@ -585,13 +621,18 @@ if (require.main === module) {
       ? createCompanyFlagSetter({ url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY })
       : null;
   if (!setCompanyFlag) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set");
+  const notifySourceDataset =
+    SUPABASE_SOURCE_DATASET_URL && SOURCE_DATASET_SECRET
+      ? createSourceDatasetNotifier({ url: SUPABASE_SOURCE_DATASET_URL, secret: SOURCE_DATASET_SECRET })
+      : null;
   const app = createApp({
     bigquery: new BigQuery({ projectId: PROJECT }),
     dispatch: dispatchToGitHub,
     setCompanyFlag,
+    notifySourceDataset,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
 }
 
-module.exports = { CATALOG, COMPANY_FLAGS, buildPlan, findMissingTables, createCompanyFlagSetter, createApp };
+module.exports = { CATALOG, COMPANY_FLAGS, buildPlan, findMissingTables, createCompanyFlagSetter, createSourceDatasetNotifier, createApp };

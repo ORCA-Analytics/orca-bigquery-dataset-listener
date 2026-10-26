@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildPlan, createApp, createCompanyFlagSetter } = require("../server.js");
+const http = require("node:http");
+const util = require("node:util");
+const { buildPlan, createApp, createCompanyFlagSetter, createSourceDatasetNotifier } = require("../server.js");
 
 const HOUR = 3600000;
 const NOW = Date.parse("2026-10-07T12:00:00Z");
@@ -42,10 +44,11 @@ async function deliver(app, body) {
   }
 }
 
-function setup(bigqueryOptions, { dispatchError, setCompanyFlag } = {}) {
+function setup(bigqueryOptions, { dispatchError, setCompanyFlag, notifySourceDataset } = {}) {
   const dispatched = [];
   const app = createApp({
     setCompanyFlag,
+    notifySourceDataset,
     bigquery: fakeBigQuery(bigqueryOptions),
     dispatch: async (payload) => {
       if (dispatchError) throw dispatchError;
@@ -357,6 +360,173 @@ test("throws on a Supabase error so the caller logs it", async () => {
     fetchImpl: async () => ({ ok: false, status: 401, text: async () => "bad key" }),
   });
   await assert.rejects(setCompanyFlag({ parent: "fairing", client: "acme" }), /401 bad key/);
+});
+
+// --- Source dataset ping (Supabase edge function source-dataset-created) ---
+
+const SECRET = "test-source-secret-must-not-be-logged";
+const FACEBOOK_TABLES = ["ad_sets", "ads", "ads_insights", "campaigns"];
+
+// The push body as the Pub/Sub subscription sends it: BigQuery's InsertDataset
+// audit log entry, base64-encoded in message.data.
+function auditLogPush(datasetId, createdAt) {
+  const logEntry = {
+    protoPayload: {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      serviceName: "bigquery.googleapis.com",
+      methodName: "google.cloud.bigquery.v2.DatasetService.InsertDataset",
+      resourceName: `projects/orcaanalytics/datasets/${datasetId}`,
+      authenticationInfo: { principalEmail: "connector@example.com" },
+      resourceLocation: { currentLocations: ["US"] },
+    },
+    resource: { type: "bigquery_dataset", labels: { project_id: "orcaanalytics", dataset_id: datasetId } },
+    timestamp: new Date(createdAt).toISOString(),
+    severity: "NOTICE",
+    logName: "projects/orcaanalytics/logs/cloudaudit.googleapis.com%2Factivity",
+  };
+  return {
+    message: {
+      data: Buffer.from(JSON.stringify(logEntry)).toString("base64"),
+      messageId: "1234567890",
+      publishTime: new Date(createdAt + 5000).toISOString(),
+    },
+    subscription: "projects/orcaanalytics/subscriptions/test",
+  };
+}
+
+// Local stand-in for the edge function: records each request and answers with
+// `status`, or never with `hang`.
+async function fakeEdgeFunction(t, { status = 200, hang = false } = {}) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      requests.push({ method: req.method, path: req.url, headers: req.headers, body: JSON.parse(body) });
+      if (!hang) res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify({ status }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => (server.closeAllConnections(), server.close()));
+  return { url: `http://127.0.0.1:${server.address().port}/functions/v1/source-dataset-created`, requests };
+}
+
+// Everything the handler logs, one string per call.
+function captureLogs(t) {
+  const lines = [];
+  for (const level of ["log", "warn", "error"]) {
+    t.mock.method(console, level, (...args) =>
+      lines.push(args.map((a) => (typeof a === "string" ? a : util.inspect(a, { depth: null }))).join(" "))
+    );
+  }
+  return lines;
+}
+
+test("pings source-dataset-created with the dataset id and shared secret after dispatching", async (t) => {
+  const logs = captureLogs(t);
+  const edge = await fakeEdgeFunction(t);
+  const { app, dispatched } = setup(
+    { datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } },
+    { notifySourceDataset: createSourceDatasetNotifier({ url: edge.url, secret: SECRET }) }
+  );
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW - HOUR)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(edge.requests.length, 1);
+  const [ping] = edge.requests;
+  assert.equal(ping.method, "POST");
+  assert.equal(ping.path, "/functions/v1/source-dataset-created");
+  assert.deepEqual(ping.body, { dataset_id: "facebook_ads__testbrand" });
+  assert.equal(ping.headers["x-orca-source-secret"], SECRET);
+  assert.equal(ping.headers["content-type"], "application/json");
+  assert.equal(ping.headers.authorization, undefined);
+  assert.ok(logs.some((l) => l.startsWith("SOURCE_DATASET_PINGED") && l.includes("status: 200")));
+  assert.ok(!logs.some((l) => l.includes(SECRET)));
+});
+
+test("only pings for datasets it dispatches", async (t) => {
+  captureLogs(t);
+  const pinged = [];
+  const { app, dispatched } = setup(
+    {
+      datasets: {
+        shopify__acme: ["orders"],
+        amazong_ads__acme: ["campaign_history"],
+        amazon_sellercentral__acme_airbyte_fulfillments: ["GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL"],
+      },
+    },
+    { notifySourceDataset: async (id) => (pinged.push(id), 200) }
+  );
+  assert.equal(await deliver(app, auditLogPush("unknown__acme", NOW)), 204); // no template
+  assert.equal(await deliver(app, auditLogPush("shopify__acme", NOW)), 429); // still waiting for tables
+  assert.equal(await deliver(app, auditLogPush("amazong_ads__acme", NOW)), 204); // company setting only
+  // NOT_DISPATCHING: none of the template's tables after the max wait
+  assert.equal(await deliver(app, auditLogPush("amazon_sellercentral__acme_airbyte_fulfillments", NOW - 73 * HOUR)), 204);
+  assert.equal(dispatched.length, 0);
+  assert.deepEqual(pinged, []);
+});
+
+test("doesn't ping when the GitHub dispatch fails", async (t) => {
+  captureLogs(t);
+  const pinged = [];
+  const { app } = setup(
+    { datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } },
+    { dispatchError: new Error("GitHub down"), notifySourceDataset: async (id) => (pinged.push(id), 200) }
+  );
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW)), 500);
+  assert.deepEqual(pinged, []);
+});
+
+test("an edge function error never fails the message (a retry would re-dispatch)", async (t) => {
+  const logs = captureLogs(t);
+  const edge = await fakeEdgeFunction(t, { status: 401 });
+  const { app, dispatched } = setup(
+    { datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } },
+    { notifySourceDataset: createSourceDatasetNotifier({ url: edge.url, secret: SECRET }) }
+  );
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(edge.requests.length, 1);
+  assert.ok(logs.some((l) => l.startsWith("SOURCE_DATASET_PING_FAILED") && l.includes("failed: 401")));
+  assert.ok(!logs.some((l) => l.includes(SECRET)));
+});
+
+test("an unreachable edge function never fails the message", async (t) => {
+  const logs = captureLogs(t);
+  // A port nothing listens on any more.
+  const closed = http.createServer();
+  await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const { port } = closed.address();
+  await new Promise((resolve) => closed.close(resolve));
+  const { app, dispatched } = setup(
+    { datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } },
+    { notifySourceDataset: createSourceDatasetNotifier({ url: `http://127.0.0.1:${port}/`, secret: SECRET }) }
+  );
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.ok(logs.some((l) => l.startsWith("SOURCE_DATASET_PING_FAILED") && l.includes("ECONNREFUSED")));
+  assert.ok(!logs.some((l) => l.includes(SECRET)));
+});
+
+test("gives up on an edge function that hangs, and still acks", async (t) => {
+  const logs = captureLogs(t);
+  const edge = await fakeEdgeFunction(t, { hang: true });
+  const { app, dispatched } = setup(
+    { datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } },
+    { notifySourceDataset: createSourceDatasetNotifier({ url: edge.url, secret: SECRET, timeoutMs: 50 }) }
+  );
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(edge.requests.length, 1);
+  assert.ok(logs.some((l) => l.startsWith("SOURCE_DATASET_PING_FAILED") && l.includes("timeout")));
+});
+
+test("skips the ping with one log line when it isn't configured", async (t) => {
+  const logs = captureLogs(t);
+  const { app, dispatched } = setup({ datasets: { facebook_ads__testbrand: FACEBOOK_TABLES } });
+  assert.equal(await deliver(app, auditLogPush("facebook_ads__testbrand", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(logs.filter((l) => l.startsWith("SOURCE_DATASET_PING")).length, 1);
+  assert.ok(logs.some((l) => l.startsWith("SOURCE_DATASET_PING_SKIPPED")));
 });
 
 // --- Optional entries (Google Ads search terms) ---

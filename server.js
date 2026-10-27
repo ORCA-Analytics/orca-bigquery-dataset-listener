@@ -380,6 +380,21 @@ function clientPrefixes(client) {
   return parts.map((_, i) => parts.slice(0, i + 1).join("_")).filter(Boolean);
 }
 
+// The `companies.table_identifier` filter for a dataset's client: the client
+// itself, or with matchClientPrefix any table_identifier the client starts with.
+function tableIdentifierFilter(client, matchClientPrefix) {
+  return matchClientPrefix
+    ? `in.(${clientPrefixes(client).map(encodeURIComponent).join(",")})`
+    : `eq.${encodeURIComponent(client)}`;
+}
+
+// The rows with the longest table_identifier, so acme_us_airbyte picks acme_us over acme.
+function longestMatches(rows) {
+  const idOf = (r) => String(r.table_identifier ?? "");
+  const longest = rows.reduce((best, r) => (idOf(r).length > best.length ? idOf(r) : best), "");
+  return rows.filter((r) => idOf(r) === longest);
+}
+
 // A call to Supabase's REST API with the service-role key. Each call is capped:
 // this runs inside the Pub/Sub push request, and a hang past the ack deadline
 // would make Pub/Sub redeliver and re-dispatch the scaffold.
@@ -415,14 +430,9 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
     if (!flag) return { status: "no_flag" };
     const { column, value, unset } = flag;
 
-    const match = flag.matchClientPrefix
-      ? `in.(${clientPrefixes(client).map(encodeURIComponent).join(",")})`
-      : `eq.${encodeURIComponent(client)}`;
+    const match = tableIdentifierFilter(client, flag.matchClientPrefix);
     const rows = await request(`companies?table_identifier=${match}&select=id,company_name,table_identifier,${column}`);
-    // Longest match wins, so acme_us_airbyte picks acme_us over acme.
-    const idOf = (r) => String(r.table_identifier ?? "");
-    const tableIdentifier = rows.reduce((best, r) => (idOf(r).length > best.length ? idOf(r) : best), "");
-    const companies = rows.filter((r) => idOf(r) === tableIdentifier);
+    const companies = longestMatches(rows);
     if (companies.length !== 1) return { status: "company_not_unique", column, matches: companies.length };
 
     const company = companies[0];
@@ -440,7 +450,7 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
   };
 }
 
-// --- 4️⃣ Pacing model ---
+// --- 4️⃣ Pacing model and scaffold settings ---
 // orca-dbt's pacing template reads Shopify plus these spend and session
 // sources. A scaffold for any of them also sends models/pacing/pacing__<client>.sql,
 // once shopify__<client> has landed, so the model is written when the first
@@ -463,9 +473,10 @@ const PACING_SOURCES = [
   "twitter_ads",
 ];
 
-// companies.revenue_measured_by -> the template's revenue line. Unset means
-// Gross Revenue, the ORCA app's default; a custom definition needs a
-// hand-built model, so no pacing file is sent.
+// companies.revenue_measured_by -> the templates' revenue line (the pacing
+// model's and shopify_newreturn's pacing_revenue). Unset means Gross Revenue,
+// the ORCA app's default. A custom definition needs hand-built models, so the
+// scaffolds keep Gross Revenue and no pacing file is sent.
 const REVENUE_BASES = {
   "Gross Revenue": "gross",
   "Gross - Discounts": "gross_discounts",
@@ -516,27 +527,68 @@ function timezoneTag(timezone) {
   return best;
 }
 
-// Reads the settings the pacing model is rendered with, for the one company
-// whose table_identifier is the client.
-function createPacingSettingsReader({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
+// Reads the settings a brand's scaffolds render with, for the one company whose
+// table_identifier is the client (with matchClientPrefix, the longest one the
+// client starts with, as for the Amazon company setting).
+function createCompanySettingsReader({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
   const request = supabaseRequester({ url, serviceRoleKey, fetchImpl, timeoutMs });
-  return async function readPacingSettings(client) {
+  return async function readCompanySettings(client, { matchClientPrefix = false } = {}) {
     const rows = await request(
-      `companies?table_identifier=eq.${encodeURIComponent(client)}&select=timezone,revenue_measured_by`
+      `companies?table_identifier=${tableIdentifierFilter(client, matchClientPrefix)}&select=table_identifier,timezone,revenue_measured_by`
     );
-    if (rows.length !== 1) return { status: "company_not_unique", matches: rows.length };
-    return { status: "ok", timezone: rows[0].timezone, revenueMeasuredBy: rows[0].revenue_measured_by };
+    const companies = longestMatches(rows);
+    if (companies.length !== 1) return { status: "company_not_unique", matches: companies.length };
+    return { status: "ok", timezone: companies[0].timezone, revenueMeasuredBy: companies[0].revenue_measured_by };
   };
+}
+
+// The shape the ORCA app accepts for an IANA zone before it reaches BigQuery
+// (orcaanalytics-webapp utils/bigquery/sanitizeTimezone.js). The zone is written
+// into the scaffolds' SQL, so nothing else gets through.
+const IANA_ZONE = /^[A-Za-z]+(?:[/_][A-Za-z0-9_+\-]+)*$/;
+
+function isTimeZone(timezone) {
+  if (typeof timezone !== "string" || !IANA_ZONE.test(timezone)) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+    return true;
+  } catch {
+    return false; // RangeError: not a zone
+  }
+}
+
+// What every scaffold renders with before ENG-306, and still does when a
+// setting is unknown: New York, its est schedules and Gross Revenue.
+const SCAFFOLD_DEFAULTS = { timezone: "America/New_York", timezone_tag: "est", revenue: "gross" };
+
+// A company's settings (a readCompanySettings result) -> the dispatch vars
+// every scaffold renders with: `timezone` (the IANA zone the SQL buckets dates
+// in), `timezone_tag` (its dbt Cloud schedule suffix) and `revenue` (a
+// REVENUE_BASES key). `defaulted` holds each setting that couldn't be used.
+function scaffoldSettings(settings) {
+  const vars = { ...SCAFFOLD_DEFAULTS };
+  if (settings.status !== "ok") return { vars, defaulted: { company: settings.status } };
+
+  const defaulted = {};
+  if (isTimeZone(settings.timezone)) {
+    Object.assign(vars, { timezone: settings.timezone, timezone_tag: timezoneTag(settings.timezone) });
+  } else {
+    defaulted.timezone = settings.timezone ?? null;
+  }
+  const setting = (settings.revenueMeasuredBy || "").trim();
+  if (REVENUE_BASES[setting]) vars.revenue = REVENUE_BASES[setting];
+  else if (setting) defaulted.revenue_measured_by = setting;
+  return { vars, defaulted };
 }
 
 // The pacing file to send with a scaffold of `parent`, or `skip` with the
 // reason; null when `parent` isn't a pacing source. Landed sources are the
 // dispatched one plus each other source whose dataset holds a table (orca-dbt
-// leaves out any whose model isn't on main yet). Throws on a BigQuery or
-// Supabase error.
-async function planPacing({ bigquery, readPacingSettings, parent, client }) {
+// leaves out any whose model isn't on main yet). `settings` is the company's
+// readCompanySettings result. Throws on a BigQuery error.
+async function planPacing({ bigquery, settings, parent, client }) {
   if (!PACING_SOURCES.includes(parent)) return null;
-  if (!readPacingSettings) return { skip: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set" };
+  if (settings.status === "disabled") return { skip: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set" };
 
   const holdsTables = await Promise.all(
     PACING_SOURCES.map(async (s) => s === parent || (await listTables(bigquery, `${s}__${client}`)).size > 0)
@@ -544,17 +596,20 @@ async function planPacing({ bigquery, readPacingSettings, parent, client }) {
   const sources = PACING_SOURCES.filter((_, i) => holdsTables[i]);
   if (!sources.includes("shopify")) return { skip: `shopify__${client} hasn't landed` };
 
-  const settings = await readPacingSettings(client);
-  if (settings.status !== "ok") return { skip: settings.status, matches: settings.matches };
-  const setting = (settings.revenueMeasuredBy || "").trim();
-  const revenue = setting ? REVENUE_BASES[setting] : "gross";
-  if (!revenue) return { skip: "revenue_measured_by needs a hand-built model", revenueMeasuredBy: setting };
+  if (settings.status !== "ok") {
+    const { status, ...detail } = settings;
+    return { skip: status, ...detail };
+  }
+  const { vars, defaulted } = scaffoldSettings(settings);
+  if (defaulted.revenue_measured_by) {
+    return { skip: "revenue_measured_by needs a hand-built model", revenueMeasuredBy: defaulted.revenue_measured_by };
+  }
 
   return {
     file: {
       template: "templates/pacing/pacing.sql",
       path: `models/pacing/pacing__${client}.sql`,
-      vars: { sources, timezone_tag: timezoneTag(settings.timezone), revenue },
+      vars: { sources, timezone_tag: vars.timezone_tag, revenue: vars.revenue },
     },
   };
 }
@@ -607,7 +662,7 @@ function createApp({
   dispatch,
   setCompanyFlag = null,
   notifySourceDataset = null,
-  readPacingSettings = null,
+  readCompanySettings = null,
   now = Date.now,
   maxWaitHours = MAX_WAIT_HOURS,
 }) {
@@ -694,18 +749,37 @@ function createApp({
             else files.push(o.file);
           }
 
+          // Nothing is dispatched yet, so a redelivery after an error is safe,
+          // but a 4xx (bad key, no permission) won't clear by itself.
+          const retry = (e) => {
+            const status = e.status ?? e.code;
+            return !(status >= 400 && status < 500) && waitedHours < maxWaitHours;
+          };
+
+          // Every scaffold renders in the brand's timezone and revenue basis.
+          let settings = { status: "disabled" };
+          if (readCompanySettings) {
+            try {
+              settings = await readCompanySettings(parts.client, { matchClientPrefix: Boolean(flag?.matchClientPrefix) });
+            } catch (e) {
+              if (retry(e)) {
+                console.error("COMPANY_SETTINGS_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
+                return res.status(503).end();
+              }
+              settings = { status: "check_failed", error: e.message };
+            }
+          }
+          const { vars: settingVars, defaulted } = scaffoldSettings(settings);
+
           // A failed table check says nothing about which sources landed.
           let pacing = null;
           if (!tablesChecked) {
             if (PACING_SOURCES.includes(parts.parent)) pacing = { skip: "tables_unchecked" };
           } else {
             try {
-              pacing = await planPacing({ bigquery, readPacingSettings, ...parts });
+              pacing = await planPacing({ bigquery, settings, ...parts });
             } catch (e) {
-              // Nothing is dispatched yet, so a redelivery is safe, but a 4xx
-              // (bad key, no permission) won't clear by itself.
-              const status = e.status ?? e.code;
-              if (!(status >= 400 && status < 500) && waitedHours < maxWaitHours) {
+              if (retry(e)) {
                 console.error("PACING_CHECK_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
                 return res.status(503).end();
               }
@@ -721,10 +795,11 @@ function createApp({
             datasetId,
             files,
             ...(pacing?.file && { generated: [pacing.file] }),
-            vars: plan.vars,
+            vars: { ...plan.vars, ...settingVars },
             missingTables: missing,
           });
           console.log("✅ Dispatched to GitHub for", datasetId);
+          console.log("SCAFFOLD_SETTINGS", { datasetId, ...settingVars, ...(Object.keys(defaulted).length && { defaulted }) });
           if (pacing?.file) console.log("PACING_INCLUDED", { datasetId, path: pacing.file.path, ...pacing.file.vars });
 
           // Errors are logged, not returned, because a retry would re-dispatch.
@@ -770,8 +845,10 @@ function createApp({
 if (require.main === module) {
   const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY ? { url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY } : null;
   const setCompanyFlag = supabase ? createCompanyFlagSetter(supabase) : null;
-  const readPacingSettings = supabase ? createPacingSettingsReader(supabase) : null;
-  if (!supabase) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set (no pacing models either)");
+  const readCompanySettings = supabase ? createCompanySettingsReader(supabase) : null;
+  if (!supabase) {
+    console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set (no pacing models, and scaffolds keep New York and Gross Revenue)");
+  }
   const notifySourceDataset =
     SUPABASE_SOURCE_DATASET_URL && SOURCE_DATASET_SECRET
       ? createSourceDatasetNotifier({ url: SUPABASE_SOURCE_DATASET_URL, secret: SOURCE_DATASET_SECRET })
@@ -781,7 +858,7 @@ if (require.main === module) {
     dispatch: dispatchToGitHub,
     setCompanyFlag,
     notifySourceDataset,
-    readPacingSettings,
+    readCompanySettings,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
@@ -793,8 +870,9 @@ module.exports = {
   buildPlan,
   findMissingTables,
   createCompanyFlagSetter,
-  createPacingSettingsReader,
+  createCompanySettingsReader,
   createSourceDatasetNotifier,
   createApp,
+  scaffoldSettings,
   timezoneTag,
 };

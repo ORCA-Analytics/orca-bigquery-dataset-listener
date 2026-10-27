@@ -2,7 +2,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const util = require("node:util");
-const { buildPlan, createApp, createCompanyFlagSetter, createSourceDatasetNotifier } = require("../server.js");
+const {
+  CATALOG,
+  buildPlan,
+  createApp,
+  createCompanyFlagSetter,
+  createPacingSettingsReader,
+  createSourceDatasetNotifier,
+  timezoneTag,
+} = require("../server.js");
 
 const HOUR = 3600000;
 const NOW = Date.parse("2026-10-07T12:00:00Z");
@@ -44,11 +52,12 @@ async function deliver(app, body) {
   }
 }
 
-function setup(bigqueryOptions, { dispatchError, setCompanyFlag, notifySourceDataset } = {}) {
+function setup(bigqueryOptions, { dispatchError, setCompanyFlag, notifySourceDataset, readPacingSettings } = {}) {
   const dispatched = [];
   const app = createApp({
     setCompanyFlag,
     notifySourceDataset,
+    readPacingSettings,
     bigquery: fakeBigQuery(bigqueryOptions),
     dispatch: async (payload) => {
       if (dispatchError) throw dispatchError;
@@ -118,10 +127,10 @@ test("checks the other datasets a platform reads", async () => {
   assert.equal(dispatched.length, 0);
 });
 
-test("dispatches right away for platforms that read no raw tables", async () => {
+test("ignores pacing__ datasets: no connector makes one, and pacing rides on source scaffolds", async () => {
   const { app, dispatched } = setup({ datasets: {} });
   assert.equal(await deliver(app, pubsubBody("pacing__acme", NOW)), 204);
-  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched.length, 0);
 });
 
 test("returns 500 when the GitHub dispatch fails, so Pub/Sub retries", async () => {
@@ -583,4 +592,178 @@ test("keeps waiting for the required Google Ads tables after the searchterms day
   const { app, dispatched } = setup({ datasets: { google_ads__acme: ["custom_campaign", "custom_searchterms", "custom_pmax_searchterms"] } });
   assert.equal(await deliver(app, pubsubBody("google_ads__acme", NOW - 30 * HOUR)), 429);
   assert.equal(dispatched.length, 0);
+});
+
+// --- Pacing model (ENG-299) ---
+
+// Stands in for createPacingSettingsReader: `company` is the one companies row
+// for the client (null for none), or `error` makes every read throw.
+function pacingSettings({ company = { timezone: "America/Los_Angeles", revenue_measured_by: "Gross - Discounts" }, error } = {}) {
+  const reads = [];
+  const readPacingSettings = async (client) => {
+    reads.push(client);
+    if (error) throw error;
+    if (!company) return { status: "company_not_unique", matches: 0 };
+    return { status: "ok", timezone: company.timezone, revenueMeasuredBy: company.revenue_measured_by };
+  };
+  return { reads, readPacingSettings };
+}
+
+const PACING_FILE = { template: "templates/pacing/pacing.sql", path: "models/pacing/pacing__acme.sql" };
+
+test("first render: Shopify's scaffold sends the pacing model with the company's settings", async (t) => {
+  const logs = captureLogs(t);
+  const { reads, readPacingSettings } = pacingSettings();
+  const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+  assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 204);
+  assert.deepEqual(dispatched[0].generated, [
+    { ...PACING_FILE, vars: { sources: ["shopify"], timezone_tag: "pst", revenue: "gross_discounts" } },
+  ]);
+  assert.deepEqual(dispatched[0].files, buildPlan("shopify__acme", "orcaanalytics").files);
+  assert.deepEqual(reads, ["acme"]);
+  assert.ok(logs.some((l) => l.startsWith("PACING_INCLUDED")));
+});
+
+test("re-render: a new source's scaffold sends the model with every source that has landed", async () => {
+  const { readPacingSettings } = pacingSettings();
+  const { app, dispatched } = setup(
+    {
+      datasets: {
+        facebook_ads__acme: FACEBOOK_TABLES,
+        shopify__acme: ["orders"],
+        google_ads__acme: ["custom_campaign"],
+        tiktok_ads__acme: [], // dataset made, first sync not landed: not a source yet
+        klaviyo__acme: ["profiles"], // not a pacing source
+      },
+    },
+    { readPacingSettings }
+  );
+  assert.equal(await deliver(app, pubsubBody("facebook_ads__acme", NOW - HOUR)), 204);
+  assert.deepEqual(dispatched[0].generated[0].vars.sources, ["shopify", "facebook_ads", "google_ads"]);
+});
+
+test("a spend source that lands before Shopify sends no pacing model yet", async (t) => {
+  const logs = captureLogs(t);
+  const { reads, readPacingSettings } = pacingSettings();
+  const { app, dispatched } = setup({ datasets: { facebook_ads__acme: FACEBOOK_TABLES } }, { readPacingSettings });
+  assert.equal(await deliver(app, pubsubBody("facebook_ads__acme", NOW - HOUR)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].generated, undefined);
+  assert.deepEqual(reads, []);
+  assert.ok(logs.some((l) => l.startsWith("PACING_SKIPPED") && l.includes("shopify__acme hasn't landed")));
+});
+
+test("can't overwrite a hand-built model: pacing only ever goes in `generated`, which orca-dbt writes only while the file is generated", async () => {
+  for (const datasetId of Object.keys(CATALOG).map((parent) => `${parent}__acme`)) {
+    assert.ok(!buildPlan(datasetId, "orcaanalytics").files.some((f) => f.path.startsWith("models/pacing/")), datasetId);
+  }
+  const { readPacingSettings } = pacingSettings();
+  const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+  await deliver(app, pubsubBody("shopify__acme", NOW - HOUR));
+  assert.ok(!dispatched[0].files.some((f) => f.path.startsWith("models/pacing/")));
+  assert.equal(dispatched[0].generated[0].path, PACING_FILE.path);
+});
+
+test("unset settings render as est and Gross Revenue", async () => {
+  const { readPacingSettings } = pacingSettings({ company: { timezone: null, revenue_measured_by: null } });
+  const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+  await deliver(app, pubsubBody("shopify__acme", NOW - HOUR));
+  assert.deepEqual(dispatched[0].generated[0].vars, { sources: ["shopify"], timezone_tag: "est", revenue: "gross" });
+});
+
+test("no pacing model for an unmatched company or a custom revenue definition; the scaffold still goes", async (t) => {
+  for (const company of [null, { timezone: "America/New_York", revenue_measured_by: "Gross - Grin orders" }]) {
+    const logs = captureLogs(t);
+    const { readPacingSettings } = pacingSettings({ company });
+    const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+    assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 204);
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].generated, undefined);
+    assert.ok(logs.some((l) => l.startsWith("PACING_SKIPPED")));
+  }
+});
+
+test("redelivers (503) when Supabase is unreachable, since nothing is dispatched yet", async (t) => {
+  captureLogs(t);
+  const { readPacingSettings } = pacingSettings({ error: new TypeError("fetch failed") });
+  const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+  assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 503);
+  assert.equal(dispatched.length, 0);
+});
+
+test("after the max wait, or on a 4xx that won't clear, dispatches without the pacing model", async (t) => {
+  captureLogs(t);
+  const cases = [
+    [new TypeError("fetch failed"), 73 * HOUR],
+    [Object.assign(new Error("Supabase GET failed: 401 bad key"), { status: 401 }), HOUR],
+  ];
+  for (const [error, age] of cases) {
+    const { readPacingSettings } = pacingSettings({ error });
+    const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readPacingSettings });
+    assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - age)), 204);
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].generated, undefined);
+  }
+});
+
+test("no pacing model when the table check failed (can't tell what landed)", async (t) => {
+  captureLogs(t);
+  const { reads, readPacingSettings } = pacingSettings();
+  const denied = Object.assign(new Error("Access Denied"), { code: 403 });
+  const { app, dispatched } = setup({ error: denied }, { readPacingSettings });
+  assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW)), 204);
+  assert.equal(dispatched[0].generated, undefined);
+  assert.deepEqual(reads, []);
+});
+
+test("sources the pacing model doesn't read never send it", async () => {
+  const { reads, readPacingSettings } = pacingSettings();
+  const { app, dispatched } = setup(
+    { datasets: { klaviyo__acme: ["profiles"], shopify__acme: SHOPIFY_TABLES } },
+    { readPacingSettings }
+  );
+  assert.equal(await deliver(app, pubsubBody("klaviyo__acme", NOW - HOUR)), 204);
+  assert.equal(dispatched[0].generated, undefined);
+  assert.deepEqual(reads, []);
+});
+
+test("timezone tags follow the nearest dbt Cloud schedule", () => {
+  const expected = {
+    "America/New_York": "est",
+    "America/Toronto": "est",
+    "America/Chicago": "cst",
+    "America/Denver": "mst",
+    "America/Phoenix": "mst",
+    "America/Los_Angeles": "pst",
+    "Europe/London": "gmt",
+    "Europe/Berlin": "gmt",
+    "Australia/Sydney": "aest",
+    "Australia/Brisbane": "aest",
+    UTC: "gmt",
+  };
+  for (const [zone, tag] of Object.entries(expected)) assert.equal(timezoneTag(zone), tag, zone);
+  for (const unset of [null, undefined, "", "Not/AZone"]) assert.equal(timezoneTag(unset), "est");
+});
+
+test("reads timezone and revenue basis for the one company with that table_identifier", async () => {
+  const requests = [];
+  const reply = (rows) => async (url, init) => (requests.push({ url, headers: init.headers }), { ok: true, json: async () => rows });
+  const one = createPacingSettingsReader({
+    url: "https://sb.test",
+    serviceRoleKey: "key",
+    fetchImpl: reply([{ timezone: "America/Chicago", revenue_measured_by: "Gross Revenue" }]),
+  });
+  assert.deepEqual(await one("acme"), { status: "ok", timezone: "America/Chicago", revenueMeasuredBy: "Gross Revenue" });
+  assert.equal(requests[0].url, "https://sb.test/rest/v1/companies?table_identifier=eq.acme&select=timezone,revenue_measured_by");
+  assert.equal(requests[0].headers.Authorization, "Bearer key");
+
+  const two = createPacingSettingsReader({ url: "https://sb.test", serviceRoleKey: "key", fetchImpl: reply([{}, {}]) });
+  assert.deepEqual(await two("acme"), { status: "company_not_unique", matches: 2 });
+
+  const denied = createPacingSettingsReader({
+    url: "https://sb.test",
+    serviceRoleKey: "key",
+    fetchImpl: async () => ({ ok: false, status: 401, text: async () => "bad key" }),
+  });
+  await assert.rejects(denied("acme"), { status: 401 });
 });

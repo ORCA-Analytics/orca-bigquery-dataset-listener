@@ -277,7 +277,6 @@ const CATALOG = {
       },
     ],
   },
-  pacing: { entries: [{ rel: "", tpl: "pacing" }] },
   rakuten: { entries: [{ rel: "", tpl: "rakuten", tables: ["rakuten__{client}.report"] }] },
   twitter_ads: { entries: [{ rel: "", tpl: "twitter_ads", tables: ["twitter_ads__{client}.campaign_report"] }] },
 };
@@ -381,28 +380,35 @@ function clientPrefixes(client) {
   return parts.map((_, i) => parts.slice(0, i + 1).join("_")).filter(Boolean);
 }
 
-// Turns on the company setting for a new source, via Supabase's REST API.
-// Matches the company on `table_identifier` (the dataset's client part, or for
-// Amazon the longest table_identifier it starts with) and only writes when
-// exactly one company matches and the column is still unset.
-function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
+// A call to Supabase's REST API with the service-role key. Each call is capped:
+// this runs inside the Pub/Sub push request, and a hang past the ack deadline
+// would make Pub/Sub redeliver and re-dispatch the scaffold.
+function supabaseRequester({ url, serviceRoleKey, fetchImpl, timeoutMs }) {
   const headers = {
     apikey: serviceRoleKey,
     Authorization: `Bearer ${serviceRoleKey}`,
     "Content-Type": "application/json",
   };
-
-  // Each call is capped: this runs inside the Pub/Sub push request, and a hang
-  // past the ack deadline would make Pub/Sub redeliver and re-dispatch the scaffold.
-  async function request(path, init = {}) {
+  return async function request(path, init = {}) {
     const resp = await fetchImpl(`${url}/rest/v1/${path}`, {
       ...init,
       headers: { ...headers, ...init.headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!resp.ok) throw new Error(`Supabase ${init.method || "GET"} failed: ${resp.status} ${await resp.text()}`);
+    if (!resp.ok) {
+      const error = new Error(`Supabase ${init.method || "GET"} failed: ${resp.status} ${await resp.text()}`);
+      throw Object.assign(error, { status: resp.status });
+    }
     return resp.json();
-  }
+  };
+}
+
+// Turns on the company setting for a new source, via Supabase's REST API.
+// Matches the company on `table_identifier` (the dataset's client part, or for
+// Amazon the longest table_identifier it starts with) and only writes when
+// exactly one company matches and the column is still unset.
+function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
+  const request = supabaseRequester({ url, serviceRoleKey, fetchImpl, timeoutMs });
 
   return async function setCompanyFlag({ parent, client }) {
     const flag = companyFlagFor(parent);
@@ -434,7 +440,126 @@ function createCompanyFlagSetter({ url, serviceRoleKey, fetchImpl = fetch, timeo
   };
 }
 
-// --- 4️⃣ GitHub dispatch helper ---
+// --- 4️⃣ Pacing model ---
+// orca-dbt's pacing template reads Shopify plus these spend and session
+// sources. A scaffold for any of them also sends models/pacing/pacing__<client>.sql,
+// once shopify__<client> has landed, so the model is written when the first
+// source lands and re-rendered with each new one. It goes in the payload's
+// `generated` list, which orca-dbt writes only while the file is missing or
+// still carries its generated marker, so hand-built models are never touched.
+// Keep in sync with PACING_SOURCE_MODELS in orca-dbt .github/scripts/scaffold.js.
+const PACING_SOURCES = [
+  "shopify",
+  "facebook_ads",
+  "google_ads",
+  "google_analytics_4",
+  "tiktok_ads",
+  "applovin",
+  "bing_ads",
+  "liveintent",
+  "pinterest_ads",
+  "shareasale",
+  "snapchat_ads",
+  "twitter_ads",
+];
+
+// companies.revenue_measured_by -> the template's revenue line. Unset means
+// Gross Revenue, the ORCA app's default; a custom definition needs a
+// hand-built model, so no pacing file is sent.
+const REVENUE_BASES = {
+  "Gross Revenue": "gross",
+  "Gross - Discounts": "gross_discounts",
+  "Gross - Discounts + Shipping": "gross_discounts_shipping",
+  "Gross + Shipping": "gross_shipping",
+  "Net (Gross - Discounts - Returns)": "net",
+  "Net + Shipping (Gross - Discounts - Returns + Shipping)": "net_shipping",
+  "Total (Gross - Discounts - Returns + Shipping + Tax)": "total",
+  "Gross - Discounts + Shipping + Tax": "gross_discounts_shipping_tax",
+};
+
+// The dbt Cloud schedules (`daily3_<tag>`) and a zone each one runs for.
+const TIMEZONE_TAGS = {
+  est: "America/New_York",
+  cst: "America/Chicago",
+  mst: "America/Denver",
+  pst: "America/Los_Angeles",
+  gmt: "Europe/London",
+  aest: "Australia/Sydney",
+};
+const MID_JANUARY = new Date(Date.UTC(2026, 0, 15, 12));
+
+function utcOffsetMinutes(timeZone, date) {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" })
+    .formatToParts(date)
+    .find((p) => p.type === "timeZoneName").value; // "GMT-05:00", or "GMT" for UTC
+  const m = /GMT([+-])(\d{2}):(\d{2})/.exec(name);
+  return m ? (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0;
+}
+
+// companies.timezone -> the tag whose zone has the nearest UTC offset in
+// January (America/Phoenix -> mst, Europe/Berlin -> gmt). Unset or not a zone
+// means est, as the scaffolds use.
+function timezoneTag(timezone) {
+  if (!timezone) return "est"; // Intl would use the server's own zone
+  let offset;
+  try {
+    offset = utcOffsetMinutes(timezone, MID_JANUARY);
+  } catch {
+    return "est"; // RangeError: not a zone
+  }
+  let best = "est";
+  let bestDiff = Infinity;
+  for (const [tag, zone] of Object.entries(TIMEZONE_TAGS)) {
+    const diff = Math.abs(utcOffsetMinutes(zone, MID_JANUARY) - offset);
+    if (diff < bestDiff) [best, bestDiff] = [tag, diff];
+  }
+  return best;
+}
+
+// Reads the settings the pacing model is rendered with, for the one company
+// whose table_identifier is the client.
+function createPacingSettingsReader({ url, serviceRoleKey, fetchImpl = fetch, timeoutMs = 5000 }) {
+  const request = supabaseRequester({ url, serviceRoleKey, fetchImpl, timeoutMs });
+  return async function readPacingSettings(client) {
+    const rows = await request(
+      `companies?table_identifier=eq.${encodeURIComponent(client)}&select=timezone,revenue_measured_by`
+    );
+    if (rows.length !== 1) return { status: "company_not_unique", matches: rows.length };
+    return { status: "ok", timezone: rows[0].timezone, revenueMeasuredBy: rows[0].revenue_measured_by };
+  };
+}
+
+// The pacing file to send with a scaffold of `parent`, or `skip` with the
+// reason; null when `parent` isn't a pacing source. Landed sources are the
+// dispatched one plus each other source whose dataset holds a table (orca-dbt
+// leaves out any whose model isn't on main yet). Throws on a BigQuery or
+// Supabase error.
+async function planPacing({ bigquery, readPacingSettings, parent, client }) {
+  if (!PACING_SOURCES.includes(parent)) return null;
+  if (!readPacingSettings) return { skip: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set" };
+
+  const holdsTables = await Promise.all(
+    PACING_SOURCES.map(async (s) => s === parent || (await listTables(bigquery, `${s}__${client}`)).size > 0)
+  );
+  const sources = PACING_SOURCES.filter((_, i) => holdsTables[i]);
+  if (!sources.includes("shopify")) return { skip: `shopify__${client} hasn't landed` };
+
+  const settings = await readPacingSettings(client);
+  if (settings.status !== "ok") return { skip: settings.status, matches: settings.matches };
+  const setting = (settings.revenueMeasuredBy || "").trim();
+  const revenue = setting ? REVENUE_BASES[setting] : "gross";
+  if (!revenue) return { skip: "revenue_measured_by needs a hand-built model", revenueMeasuredBy: setting };
+
+  return {
+    file: {
+      template: "templates/pacing/pacing.sql",
+      path: `models/pacing/pacing__${client}.sql`,
+      vars: { sources, timezone_tag: timezoneTag(settings.timezone), revenue },
+    },
+  };
+}
+
+// --- 5️⃣ GitHub dispatch helper ---
 async function dispatchToGitHub(payload) {
   const resp = await fetch(
     `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/dispatches`,
@@ -459,7 +584,7 @@ async function dispatchToGitHub(payload) {
   }
 }
 
-// --- 5️⃣ Source dataset ping ---
+// --- 6️⃣ Source dataset ping ---
 // Tells the ORCA app a brand's source dataset landed, so its onboarding
 // checklist can tick that source as connected. Capped like the company flag
 // calls: a hang past the Pub/Sub ack deadline would redeliver and re-dispatch.
@@ -476,12 +601,13 @@ function createSourceDatasetNotifier({ url, secret, fetchImpl = fetch, timeoutMs
   };
 }
 
-// --- 6️⃣ Express routes ---
+// --- 7️⃣ Express routes ---
 function createApp({
   bigquery,
   dispatch,
   setCompanyFlag = null,
   notifySourceDataset = null,
+  readPacingSettings = null,
   now = Date.now,
   maxWaitHours = MAX_WAIT_HOURS,
 }) {
@@ -567,13 +693,39 @@ function createApp({
             if (notThere.length) console.log("SKIPPING_OPTIONAL_MODEL", { datasetId, path: o.file.path, missing: notThere });
             else files.push(o.file);
           }
+
+          // A failed table check says nothing about which sources landed.
+          let pacing = null;
+          if (!tablesChecked) {
+            if (PACING_SOURCES.includes(parts.parent)) pacing = { skip: "tables_unchecked" };
+          } else {
+            try {
+              pacing = await planPacing({ bigquery, readPacingSettings, ...parts });
+            } catch (e) {
+              // Nothing is dispatched yet, so a redelivery is safe, but a 4xx
+              // (bad key, no permission) won't clear by itself.
+              const status = e.status ?? e.code;
+              if (!(status >= 400 && status < 500) && waitedHours < maxWaitHours) {
+                console.error("PACING_CHECK_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
+                return res.status(503).end();
+              }
+              pacing = { skip: "check_failed", error: e.message };
+            }
+          }
+          if (pacing?.skip) {
+            const { skip, ...detail } = pacing;
+            console.log("PACING_SKIPPED", { datasetId, reason: skip, ...detail });
+          }
+
           await dispatch({
             datasetId,
             files,
+            ...(pacing?.file && { generated: [pacing.file] }),
             vars: plan.vars,
             missingTables: missing,
           });
           console.log("✅ Dispatched to GitHub for", datasetId);
+          if (pacing?.file) console.log("PACING_INCLUDED", { datasetId, path: pacing.file.path, ...pacing.file.vars });
 
           // Errors are logged, not returned, because a retry would re-dispatch.
           if (!notifySourceDataset) {
@@ -616,11 +768,10 @@ function createApp({
 }
 
 if (require.main === module) {
-  const setCompanyFlag =
-    SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-      ? createCompanyFlagSetter({ url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY })
-      : null;
-  if (!setCompanyFlag) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set");
+  const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY ? { url: SUPABASE_URL, serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY } : null;
+  const setCompanyFlag = supabase ? createCompanyFlagSetter(supabase) : null;
+  const readPacingSettings = supabase ? createPacingSettingsReader(supabase) : null;
+  if (!supabase) console.warn("COMPANY_FLAGS_DISABLED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set (no pacing models either)");
   const notifySourceDataset =
     SUPABASE_SOURCE_DATASET_URL && SOURCE_DATASET_SECRET
       ? createSourceDatasetNotifier({ url: SUPABASE_SOURCE_DATASET_URL, secret: SOURCE_DATASET_SECRET })
@@ -630,9 +781,20 @@ if (require.main === module) {
     dispatch: dispatchToGitHub,
     setCompanyFlag,
     notifySourceDataset,
+    readPacingSettings,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
 }
 
-module.exports = { CATALOG, COMPANY_FLAGS, buildPlan, findMissingTables, createCompanyFlagSetter, createSourceDatasetNotifier, createApp };
+module.exports = {
+  CATALOG,
+  COMPANY_FLAGS,
+  buildPlan,
+  findMissingTables,
+  createCompanyFlagSetter,
+  createPacingSettingsReader,
+  createSourceDatasetNotifier,
+  createApp,
+  timezoneTag,
+};

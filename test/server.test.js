@@ -175,18 +175,24 @@ test("amazon_ads scaffolds only the Amazon Ads model", () => {
   assert.ok(plan.tables.every((t) => t.startsWith("amazon_ads__acme.")));
 });
 
-test("Seller Central is ready with either loader's table names", async () => {
-  for (const tables of [
-    ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"], // Airbyte
-    ["sales_and_traffic_business_report_daily", "orders"], // Fivetran
-  ]) {
-    const flags = recordFlags();
-    const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: tables } }, flags);
-    assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 204);
-    assert.equal(dispatched.length, 1);
-    assert.deepEqual(dispatched[0].missingTables, []);
-    assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme" }]);
-  }
+test("Seller Central waits for Airbyte's report, Orders and fulfilled shipments", async () => {
+  const flags = recordFlags();
+  const tables = ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"];
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: tables } }, flags);
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 429);
+  tables.push("GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL");
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 204);
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].missingTables, []);
+  assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme" }]);
+});
+
+test("Seller Central doesn't take Fivetran's table names", async () => {
+  const { app, dispatched } = setup({
+    datasets: { amazon_sellercentral__acme: ["sales_and_traffic_business_report_daily", "orders", "fulfilled_shipments_data_general_report"] },
+  });
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - 73 * HOUR)), 204);
+  assert.equal(dispatched.length, 0);
 });
 
 test("doesn't scaffold an Amazon dataset that never gets a template's tables, but still turns Amazon on", async () => {
@@ -206,7 +212,10 @@ test("turns Amazon on even when a template's tables are still partly missing aft
     flags
   );
   assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - 73 * HOUR)), 204);
-  assert.deepEqual(dispatched[0].missingTables, ["amazon_sellercentral__acme.Orders|orders"]);
+  assert.deepEqual(dispatched[0].missingTables, [
+    "amazon_sellercentral__acme.Orders",
+    "amazon_sellercentral__acme.GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
+  ]);
   assert.equal(flags.calls.length, 1);
 });
 
@@ -842,7 +851,11 @@ test("settings that are unknown or can't be used keep New York, est and Gross Re
 test("Amazon scaffolds find the company the way the Amazon setting does, by table_identifier prefix", async () => {
   const { reads, readCompanySettings } = companySettings();
   const { app, dispatched } = setup(
-    { datasets: { amazon_sellercentral__acme_airbyte: ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"] } },
+    {
+      datasets: {
+        amazon_sellercentral__acme_airbyte: ["GET_SALES_AND_TRAFFIC_REPORT", "Orders", "GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL"],
+      },
+    },
     { readCompanySettings }
   );
   assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme_airbyte", NOW - HOUR)), 204);

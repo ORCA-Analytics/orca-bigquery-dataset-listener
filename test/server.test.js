@@ -9,8 +9,11 @@ const {
   createCompanyFlagSetter,
   createCompanySettingsReader,
   createSourceDatasetNotifier,
+  createPiecePublisher,
+  PIECE_ATTRIBUTE,
   scaffoldSettings,
   timezoneTag,
+  topicName,
 } = require("../server.js");
 
 const HOUR = 3600000;
@@ -30,12 +33,13 @@ function fakeBigQuery({ datasets = {}, error } = {}) {
   };
 }
 
-function pubsubBody(datasetId, createdAt) {
+// `attributes` as on a message the listener republished for one piece.
+function pubsubBody(datasetId, createdAt, attributes) {
   const logEntry = {
     timestamp: new Date(createdAt).toISOString(),
     protoPayload: { resourceName: `projects/orcaanalytics/datasets/${datasetId}` },
   };
-  return { message: { data: Buffer.from(JSON.stringify(logEntry)).toString("base64") } };
+  return { message: { data: Buffer.from(JSON.stringify(logEntry)).toString("base64"), ...(attributes && { attributes }) } };
 }
 
 async function deliver(app, body) {
@@ -53,12 +57,13 @@ async function deliver(app, body) {
   }
 }
 
-function setup(bigqueryOptions, { dispatchError, setCompanyFlag, notifySourceDataset, readCompanySettings } = {}) {
+function setup(bigqueryOptions, { dispatchError, setCompanyFlag, notifySourceDataset, readCompanySettings, publishPieces } = {}) {
   const dispatched = [];
   const app = createApp({
     setCompanyFlag,
     notifySourceDataset,
     readCompanySettings,
+    publishPieces,
     bigquery: fakeBigQuery(bigqueryOptions),
     dispatch: async (payload) => {
       if (dispatchError) throw dispatchError;
@@ -146,44 +151,205 @@ function recordFlags() {
   return { calls, setCompanyFlag: async (args) => (calls.push(args), { status: "set" }) };
 }
 
-test("amazon_sellercentral scaffolds the Seller Central models, suffixes included", () => {
+const SC_SUMMARY = {
+  template: "templates/amazon/amazon_sellercentral/amazon_sellercentral.sql",
+  path: "models/amazon/amazon_sellercentral/amazon_sellercentral__acme.sql",
+};
+const SC_DETAIL = [
+  {
+    template: "templates/amazon/amazon_sellercentral_cohorts/amazon_sellercentral_cohorts.sql",
+    path: "models/amazon/amazon_sellercentral_cohorts/amazon_sellercentral_cohorts__acme.sql",
+  },
+  {
+    template: "templates/amazon/amazon_sellercentral_newreturn/amazon_sellercentral_newreturn.sql",
+    path: "models/amazon/amazon_sellercentral_newreturn/amazon_sellercentral_newreturn__acme.sql",
+  },
+];
+const SC_ALL_TABLES = ["GET_SALES_AND_TRAFFIC_REPORT", "Orders", "GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL"];
+
+// Records what the listener republishes; `error` makes the publish fail.
+function recordPieces({ error } = {}) {
+  const published = [];
+  return {
+    published,
+    publishPieces: async (data, names) => {
+      if (error) throw error;
+      published.push({ data, names });
+      return names.map((_, i) => String(i + 1));
+    },
+  };
+}
+
+const piece = (name) => ({ [PIECE_ATTRIBUTE]: name });
+
+test("Amazon is three pieces: ads, and Seller Central's summary and detail", () => {
+  const ads = buildPlan("amazon_ads__acme", "orcaanalytics");
+  assert.deepEqual(ads.pieces, [
+    {
+      name: "ads",
+      files: [{ template: "templates/amazon/amazon_ads/amazon_ads.sql", path: "models/amazon/amazon_ads/amazon_ads__acme.sql" }],
+      tables: [
+        "amazon_ads__acme.campaign_history",
+        "amazon_ads__acme.campaign_level_report",
+        "amazon_ads__acme.sb_campaign_history",
+        "amazon_ads__acme.sb_campaign_report",
+      ],
+      optional: [],
+    },
+  ]);
+
+  const sc = buildPlan("amazon_sellercentral__acme", "orcaanalytics");
+  assert.deepEqual(sc.pieces, [
+    { name: "summary", files: [SC_SUMMARY], tables: ["amazon_sellercentral__acme.GET_SALES_AND_TRAFFIC_REPORT"], optional: [] },
+    {
+      name: "detail",
+      files: SC_DETAIL,
+      tables: ["amazon_sellercentral__acme.Orders", "amazon_sellercentral__acme.GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL"],
+      optional: [],
+    },
+  ]);
+  assert.deepEqual(sc.files, [SC_SUMMARY, ...SC_DETAIL]);
+  assert.ok(ads.skipIncomplete && sc.skipIncomplete);
+});
+
+test("Seller Central keeps the client's loader suffix in its model names", () => {
   const plan = buildPlan("amazon_sellercentral__acme_airbyte", "orcaanalytics");
   assert.equal(plan.vars.parent, "amazon_sellercentral");
   assert.equal(plan.vars.client, "acme_airbyte");
-  assert.deepEqual(plan.files, [
-    {
-      template: "templates/amazon/amazon_sellercentral/amazon_sellercentral.sql",
-      path: "models/amazon/amazon_sellercentral/amazon_sellercentral__acme_airbyte.sql",
-    },
-    {
-      template: "templates/amazon/amazon_sellercentral_cohorts/amazon_sellercentral_cohorts.sql",
-      path: "models/amazon/amazon_sellercentral_cohorts/amazon_sellercentral_cohorts__acme_airbyte.sql",
-    },
-    {
-      template: "templates/amazon/amazon_sellercentral_newreturn/amazon_sellercentral_newreturn.sql",
-      path: "models/amazon/amazon_sellercentral_newreturn/amazon_sellercentral_newreturn__acme_airbyte.sql",
-    },
-  ]);
+  assert.deepEqual(
+    plan.files.map((f) => f.path),
+    [SC_SUMMARY, ...SC_DETAIL].map((f) => f.path.replace("__acme.sql", "__acme_airbyte.sql"))
+  );
 });
 
-test("amazon_ads scaffolds only the Amazon Ads model", () => {
-  const plan = buildPlan("amazon_ads__acme", "orcaanalytics");
-  assert.equal(plan.vars.parent, "amazon_ads");
-  assert.deepEqual(plan.files, [
-    { template: "templates/amazon/amazon_ads/amazon_ads.sql", path: "models/amazon/amazon_ads/amazon_ads__acme.sql" },
-  ]);
-  assert.ok(plan.tables.every((t) => t.startsWith("amazon_ads__acme.")));
+test("a platform names every entry's piece or none, so each republished message names one", () => {
+  for (const [parent, cfg] of Object.entries(CATALOG)) {
+    const named = cfg.entries.filter((e) => e.piece).length;
+    assert.ok(named === 0 || named === cfg.entries.length, parent);
+  }
 });
 
-test("Seller Central waits for Airbyte's report, Orders and fulfilled shipments", async () => {
+test("other platforms are one unnamed piece, and their dispatch has no piece field", async () => {
+  assert.deepEqual(
+    buildPlan("shopify__acme", "orcaanalytics").pieces.map((p) => p.name),
+    [null]
+  );
+  const { publishPieces, published } = recordPieces();
+  const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { publishPieces });
+  assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 204);
+  assert.equal(published.length, 0);
+  assert.equal(dispatched.length, 1);
+  assert.ok(!("piece" in dispatched[0]));
+});
+
+test("republishes a Seller Central dataset once per piece, and dispatches nothing itself", async () => {
+  const flags = recordFlags();
+  const { publishPieces, published } = recordPieces();
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: SC_ALL_TABLES } }, { ...flags, publishPieces });
+  const body = pubsubBody("amazon_sellercentral__acme", NOW);
+  assert.equal(await deliver(app, body), 204);
+  assert.deepEqual(published, [{ data: body.message.data, names: ["summary", "detail"] }]);
+  assert.equal(dispatched.length, 0);
+  assert.equal(flags.calls.length, 0);
+});
+
+test("the summary piece dispatches once the report lands, without waiting for the detail", async () => {
+  const flags = recordFlags();
+  const { publishPieces, published } = recordPieces();
+  const { app, dispatched } = setup(
+    { datasets: { amazon_sellercentral__acme: ["GET_SALES_AND_TRAFFIC_REPORT"] } },
+    { ...flags, publishPieces }
+  );
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - HOUR, piece("summary"))), 204);
+  assert.equal(published.length, 0);
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].piece, "summary");
+  assert.deepEqual(dispatched[0].files, [SC_SUMMARY]);
+  assert.deepEqual(dispatched[0].missingTables, []);
+  assert.equal(dispatched[0].vars.parent, "amazon_sellercentral");
+  assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme" }]);
+});
+
+test("the detail piece waits for Orders and fulfilled shipments, then dispatches on its own", async () => {
+  const tables = ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"];
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: tables } }, recordPieces());
+  const body = pubsubBody("amazon_sellercentral__acme", NOW - 30 * HOUR, piece("detail"));
+  assert.equal(await deliver(app, body), 429);
+  tables.push("GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL");
+  assert.equal(await deliver(app, body), 204);
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].piece, "detail");
+  assert.deepEqual(dispatched[0].files, SC_DETAIL);
+  assert.deepEqual(dispatched[0].missingTables, []);
+});
+
+test("a piece's max wait counts from the dataset's creation, and an incomplete one is skipped", async () => {
+  const flags = recordFlags();
+  const { app, dispatched } = setup(
+    { datasets: { amazon_sellercentral__acme: ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"] } },
+    { ...flags, publishPieces: recordPieces().publishPieces }
+  );
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - 71 * HOUR, piece("detail"))), 429);
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - 73 * HOUR, piece("detail"))), 204);
+  assert.equal(dispatched.length, 0);
+  // The dataset holds tables, so Amazon is still turned on.
+  assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme" }]);
+});
+
+test("a message for a piece the catalog no longer has is dropped", async () => {
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: SC_ALL_TABLES } });
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW, piece("orders"))), 204);
+  assert.equal(dispatched.length, 0);
+});
+
+test("Amazon Ads is one piece, so it isn't republished", async () => {
+  const { publishPieces, published } = recordPieces();
+  const tables = ["campaign_history", "campaign_level_report", "sb_campaign_history", "sb_campaign_report"];
+  const { app, dispatched } = setup({ datasets: { amazon_ads__acme: tables } }, { publishPieces });
+  assert.equal(await deliver(app, pubsubBody("amazon_ads__acme", NOW)), 204);
+  assert.equal(published.length, 0);
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].piece, "ads");
+  assert.deepEqual(dispatched[0].files, buildPlan("amazon_ads__acme", "orcaanalytics").files);
+});
+
+test("Amazon Ads without its campaign history tables isn't scaffolded after the max wait", async () => {
+  // Adapt Naturals' Fivetran dataset (OPS-199): reports, no *_campaign_history.
+  const tables = ["campaign_level_report", "sb_campaign_report", "sd_campaign_report"];
+  const { app, dispatched } = setup({ datasets: { amazon_ads__acme: tables } });
+  assert.equal(await deliver(app, pubsubBody("amazon_ads__acme", NOW)), 429);
+  assert.equal(await deliver(app, pubsubBody("amazon_ads__acme", NOW - 73 * HOUR)), 204);
+  assert.equal(dispatched.length, 0);
+});
+
+test("a failed republish is retried while nothing has been dispatched", async () => {
+  const { publishPieces } = recordPieces({ error: Object.assign(new Error("unavailable"), { status: 503 }) });
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: SC_ALL_TABLES } }, { publishPieces });
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 503);
+  assert.equal(dispatched.length, 0);
+});
+
+test("without permission to republish, the message handles every piece itself", async () => {
+  const { publishPieces } = recordPieces({ error: Object.assign(new Error("forbidden"), { status: 403 }) });
+  const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: SC_ALL_TABLES } }, { publishPieces });
+  assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 204);
+  assert.deepEqual(dispatched.map((d) => d.piece), ["summary", "detail"]);
+});
+
+test("without a topic, Seller Central waits for every piece, then dispatches each on its own", async () => {
   const flags = recordFlags();
   const tables = ["GET_SALES_AND_TRAFFIC_REPORT", "Orders"];
   const { app, dispatched } = setup({ datasets: { amazon_sellercentral__acme: tables } }, flags);
   assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 429);
   tables.push("GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL");
   assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW)), 204);
-  assert.equal(dispatched.length, 1);
-  assert.deepEqual(dispatched[0].missingTables, []);
+  assert.deepEqual(
+    dispatched.map((d) => [d.piece, d.files, d.missingTables]),
+    [
+      ["summary", [SC_SUMMARY], []],
+      ["detail", SC_DETAIL, []],
+    ]
+  );
   assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme" }]);
 });
 
@@ -205,18 +371,42 @@ test("doesn't scaffold an Amazon dataset that never gets a template's tables, bu
   assert.deepEqual(flags.calls, [{ parent: "amazon_sellercentral", client: "acme_airbyte_fulfillments" }]);
 });
 
-test("turns Amazon on even when a template's tables are still partly missing after the max wait", async () => {
+test("without a topic, a piece still missing tables after the max wait is skipped and the rest go", async () => {
   const flags = recordFlags();
   const { app, dispatched } = setup(
     { datasets: { amazon_sellercentral__acme: ["GET_SALES_AND_TRAFFIC_REPORT"] } },
     flags
   );
   assert.equal(await deliver(app, pubsubBody("amazon_sellercentral__acme", NOW - 73 * HOUR)), 204);
-  assert.deepEqual(dispatched[0].missingTables, [
-    "amazon_sellercentral__acme.Orders",
-    "amazon_sellercentral__acme.GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
-  ]);
+  assert.deepEqual(
+    dispatched.map((d) => [d.piece, d.files, d.missingTables]),
+    [["summary", [SC_SUMMARY], []]]
+  );
   assert.equal(flags.calls.length, 1);
+});
+
+test("the piece publisher sends one message per piece, each naming it, with the original data", async () => {
+  const requests = [];
+  const auth = { request: async (opts) => (requests.push(opts), { data: { messageIds: ["1", "2"] } }) };
+  const publishPieces = createPiecePublisher({ topic: "projects/orcaanalytics/topics/datasets", auth });
+  assert.deepEqual(await publishPieces("ZGF0YQ==", ["summary", "detail"]), ["1", "2"]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "https://pubsub.googleapis.com/v1/projects/orcaanalytics/topics/datasets:publish");
+  assert.equal(requests[0].method, "POST");
+  assert.deepEqual(requests[0].data, {
+    messages: [
+      { data: "ZGF0YQ==", attributes: { orca_piece: "summary" } },
+      { data: "ZGF0YQ==", attributes: { orca_piece: "detail" } },
+    ],
+  });
+  assert.equal(requests[0].timeout, 5000);
+});
+
+test("SCAFFOLD_PIECES_TOPIC takes a topic's short or full name", () => {
+  assert.equal(topicName("datasets"), "projects/orcaanalytics/topics/datasets");
+  assert.equal(topicName(" projects/other/topics/datasets\n"), "projects/other/topics/datasets");
+  assert.equal(topicName(""), null);
+  assert.equal(topicName(undefined), null);
 });
 
 test("any other amazon* dataset only turns Amazon on, once it holds a table", async () => {

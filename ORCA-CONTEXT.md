@@ -1,7 +1,7 @@
 ---
 title: "BigQuery Dataset Listener — ORCA Context"
 scope: codebase
-last_reviewed: 2026-10-27
+last_reviewed: 2026-11-13
 owner: nate
 generated_by: "cursor"
 reviewed: false
@@ -15,8 +15,8 @@ This is an **event-driven microservice** that:
 1. Listens for BigQuery dataset creation events (via Pub/Sub push)
 2. Parses the dataset name using a strict `parent__client` naming convention
 3. Looks up templates in an internal catalog based on the `parent` (e.g., `shopify`, `facebook_ads`)
-4. Waits until the raw tables those templates read exist in BigQuery (the connector's first sync creates them after the dataset)
-5. Dispatches a GitHub repository event to `ORCA-Analytics/orca-dbt` with file creation instructions and the brand's timezone and revenue basis, plus its pacing model once its Shopify data has landed
+4. Waits until the raw tables those templates read exist in BigQuery (the connector's first sync creates them after the dataset). A platform whose tables land at different times is split into pieces that wait separately (Seller Central: summary and detail)
+5. Dispatches a GitHub repository event to `ORCA-Analytics/orca-dbt` per piece, with file creation instructions and the brand's timezone and revenue basis, plus its pacing model once its Shopify data has landed
 6. The dbt repo workflow then generates client-specific SQL files from templates
 
 **Think of it as:** _Infrastructure-as-code event handler that automates dbt model scaffolding when new client datasets appear in BigQuery._
@@ -31,7 +31,7 @@ This Cloud Run service receives BigQuery audit log events (specifically dataset 
 |---|---|
 | Language | Node.js 22 (CommonJS) |
 | Framework | Express 4.x |
-| Key dependencies | `express`, `@google-cloud/bigquery` (table checks) |
+| Key dependencies | `express`, `@google-cloud/bigquery` (table checks), `google-auth-library` (republishing a dataset's pieces to Pub/Sub) |
 | Database(s) | None (stateless service) |
 | Deploys to | Google Cloud Run (`us-central1`) |
 | CI/CD | Google Cloud Build (docker build → push → deploy) |
@@ -63,6 +63,7 @@ curl http://localhost:8080/healthz
 | `SUPABASE_URL` | ORCA app Supabase project URL, for turning on company settings and reading the brand's timezone and revenue basis (optional) | Supabase project `orca_analytics` > Settings > API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role key for that project (optional) | Google Cloud Secret Manager (prod); Supabase > Settings > API |
 | `SUPABASE_SOURCE_DATASET_URL` | URL of the ORCA app's `source-dataset-created` edge function, pinged after each dispatch (optional) | `https://sscfogzzbwlgpqcnnfjx.supabase.co/functions/v1/source-dataset-created` |
+| `SCAFFOLD_PIECES_TOPIC` | The Pub/Sub topic the listener's push subscription reads (`projects/orcaanalytics/topics/<name>`, or just `<name>`), so a dataset with several pieces is republished once per piece (optional; see Pieces) | `gcloud pubsub subscriptions describe <subscription> --format='value(topic)'` |
 | `SOURCE_DATASET_SECRET` | Shared secret sent as `x-orca-source-secret` to that function (optional) | Google Cloud Secret Manager (prod); the same value the edge function checks |
 
 The Cloud Run runtime service account needs `roles/bigquery.metadataViewer` on `orcaanalytics` to list tables (see Deployment). Without it the listener logs `TABLE_CHECK_FAILED` and dispatches immediately, as it did before table checks existed.
@@ -70,6 +71,8 @@ The Cloud Run runtime service account needs `roles/bigquery.metadataViewer` on `
 Without both Supabase variables the listener logs `COMPANY_FLAGS_DISABLED` at startup and only dispatches scaffolds, as before: New York and Gross Revenue, with no pacing models.
 
 Without both source dataset variables the listener logs `SOURCE_DATASET_PING_SKIPPED` after each dispatch instead of pinging.
+
+Without `SCAFFOLD_PIECES_TOPIC` the listener logs `PIECES_TOPIC_UNSET` at startup, and a dataset with several pieces waits for all of them in one message before dispatching each (see Pieces).
 
 ## Folder Structure
 
@@ -95,6 +98,7 @@ orca-bigquery-dataset-listener/
   - `createSourceDatasetNotifier()` - tells the ORCA app's `source-dataset-created` edge function a dataset landed
   - `scaffoldSettings()` - turns the brand's `companies` settings (read by `createCompanySettingsReader()`) into the timezone and revenue vars every scaffold renders with
   - `planPacing()` - decides whether a scaffold also sends the brand's pacing model, and with which sources
+  - `createPiecePublisher()` - republishes a dataset's event to Pub/Sub once per piece (see Pieces)
 - **API routes:**
   - `GET /healthz` - health check (returns `200 ok`)
   - `POST /` - Pub/Sub push endpoint (receives base64-encoded audit log events)
@@ -114,7 +118,7 @@ flowchart LR
 ```
 
 - **Reads from:** Pub/Sub push messages containing BigQuery audit log entries (`protoPayload.resourceName`, `timestamp`), and BigQuery table listings for the datasets a scaffold reads
-- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint, including the pacing model, see Pacing model), the ORCA app's Supabase `companies` table (one setting per new source, see Company settings), and the ORCA app's `source-dataset-created` edge function (see Source dataset ping)
+- **Writes to:** GitHub API (`/repos/ORCA-Analytics/orca-dbt/dispatches` endpoint, including the pacing model, see Pacing model), its own Pub/Sub topic (one message per piece, see Pieces), the ORCA app's Supabase `companies` table (one setting per new source, see Company settings), and the ORCA app's `source-dataset-created` edge function (see Source dataset ping)
 - **Triggered by:** GCP Pub/Sub push subscription (configured external to this repo)
 - **Depended on by:** `orca-dbt` repo GitHub Actions workflow expects `bq_dataset_created` event type with specific payload structure
 
@@ -137,12 +141,18 @@ flowchart LR
 ### Code Patterns
 
 - **Single-file service:** All logic in `server.js` (no modules/imports beyond Express)
-- **Catalog-driven logic:** `CATALOG` object maps parent dataset names to template entries. Each entry's `tables` lists the raw tables its orca-dbt template reads (`dataset.table`, with `{client}` filled in), which the listener waits for. `dataset.a|b` is satisfied by either table, for loaders that name a table differently (Seller Central: Airbyte `GET_SALES_AND_TRAFFIC_REPORT`/`Orders`, Fivetran `sales_and_traffic_business_report_daily`/`orders`)
+- **Catalog-driven logic:** `CATALOG` object maps parent dataset names to template entries. Each entry's `tables` lists the raw tables its orca-dbt template reads (`dataset.table`, with `{client}` filled in), which the listener waits for. `dataset.a|b` is satisfied by either table, for loaders that name a table differently (no entry uses it since Seller Central went Airbyte only in OPS-199)
 - **Optional entries:** an entry with `optional: true` reads a table most connections don't sync (Google Ads `custom_searchterms`: 14 of 211 Google Ads datasets as of 2026-10-17). Its file is scaffolded only if all of its tables exist when the dataset dispatches, otherwise the listener logs `SKIPPING_OPTIONAL_MODEL`. Without `waitHours` its tables don't hold up the dispatch. With `waitHours` (searchterms: 24) a missing table holds the dispatch until the dataset is that old: new clients get `custom_searchterms` and `custom_pmax_searchterms` (Performance Max terms from `campaign_search_term_view`) from a separate `_searchterms` connection that can land after the main one, while older connections never sync it and a `_searchterms` source with expired OAuth never lands it. The check is on the table existing, so empty tables still get the model (a Performance Max-only account returns no rows from `search_term_view`; one without PMax returns none in `custom_pmax_searchterms`). A connection that adds the stream later gets no new dataset event, so that model is added by hand
-- **Amazon:** `amazon_ads__<client>` scaffolds the Amazon Ads model and `amazon_sellercentral__<client>` the three Seller Central models (sales, cohorts, new/return), both under orca-dbt's `templates/amazon/`. The client part often carries a loader suffix (`acme_airbyte`, `acme_us_fivetran`); the scaffold keeps it, as for every platform, so the models read the right dataset. Both entries set `requireSomeTables`: a dataset holding none of the template's tables after `MAX_WAIT_HOURS` (fulfillments-only `..._airbyte_fulfillments`, Fivetran dbt-package outputs like `amazon_ads__acme_amazon_ads_source`) is logged as `NOT_DISPATCHING` instead of scaffolded. The dispatch sends `vars.parent` = `amazon_ads` / `amazon_sellercentral`, so orca-dbt needs `templates/sources/amazon_ads.yml` and `templates/sources/amazon_sellercentral.yml`
+- **Amazon (ENG-634):** three pieces, all under orca-dbt's `templates/amazon/`:
+  - `ads`: `amazon_ads__<client>` → `amazon_ads__<client>`, once `campaign_history`, `campaign_level_report`, `sb_campaign_history` and `sb_campaign_report` exist.
+  - `summary`: `amazon_sellercentral__<client>` → `amazon_sellercentral__<client>`, once `GET_SALES_AND_TRAFFIC_REPORT` exists.
+  - `detail`: `amazon_sellercentral__<client>` → `amazon_sellercentral_cohorts__<client>` and `amazon_sellercentral_newreturn__<client>`, once `Orders` and `GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL` exist.
+
+  Seller Central is Airbyte only (OPS-199). Its report, Orders and fulfilled shipments come from three connections into one dataset and can land days apart, which is why summary and detail are separate pieces. The client part often carries a loader suffix (`acme_airbyte`, `acme_us_fivetran`); the scaffold keeps it, as for every platform, so the models read the right dataset. Both platforms set `skipIncomplete`: a piece still missing any of its tables after `MAX_WAIT_HOURS` is logged as `NOT_DISPATCHING` instead of scaffolded, because its model can't build (fulfillments-only `..._airbyte_fulfillments`, Fivetran dbt-package outputs like `amazon_ads__acme_amazon_ads_source`, or an Ads dataset without the `*_campaign_history` tables, as Adapt Naturals' Fivetran one). The dispatch sends `vars.parent` = `amazon_ads` / `amazon_sellercentral`, so orca-dbt needs `templates/sources/amazon_ads.yml` and `templates/sources/amazon_sellercentral.yml`
 - **Waiting via Pub/Sub redelivery:** while tables are missing (and the dataset is younger than `MAX_WAIT_HOURS`), the handler returns 429, so Pub/Sub redelivers the message later; no state is stored. After the max wait it dispatches anyway and includes `missingTables` in the payload
+- **Pieces (ENG-634):** a catalog entry's `piece` groups the entries scaffolded together; entries without one form a single piece, and a platform names every entry's piece or none. Each piece goes in its own dispatch, so orca-dbt opens one PR per piece and one that fails dbt Cloud doesn't hold the others. The payload carries `piece` (orca-dbt ignores it; it's for the logs). With `SCAFFOLD_PIECES_TOPIC` set, the first delivery of a dataset with several pieces publishes one message per piece to that topic, with the same data (the log entry, so the max wait still counts from the dataset's creation) and an `orca_piece` attribute, logs `PIECES_PUBLISHED`, and returns 204 without dispatching. Each piece's message then waits for its own tables and dispatches alone, so the Seller Central summary goes as soon as the report lands. A failed publish returns 503 (`PIECES_PUBLISH_FAILED`), which is safe because nothing was dispatched; a 4xx (no topic, no permission), or one past `MAX_WAIT_HOURS`, handles every piece in that message instead. Without the topic, one message waits for every piece, then dispatches each; if a dispatch fails there, the redelivery sends the pieces before it again (orca-dbt opens a second PR, or finds the files unchanged). A message naming a piece the catalog no longer has is dropped (`UNKNOWN_PIECE`). A connector that lands a piece's tables after `MAX_WAIT_HOURS` gets no new dataset event, so that piece is scaffolded by hand
 - **Company settings:** after a dispatch whose tables were checked and all exist (not after `TABLE_CHECK_FAILED`), `COMPANY_FLAGS` maps the parent to the `companies` column the ORCA app reads (e.g. `fairing` → `hdyhau = 'Fairing'`, `google_ads` → `google_ads = true`) and `createCompanyFlagSetter()` writes it through Supabase's REST API. It matches the company on `table_identifier = client` (for Amazon: any `amazon*` dataset, including ones without a template such as `amazong_ads__acme`, turns on `amazon` for the longest `table_identifier` the client starts with, so `acme_us_airbyte` finds `acme_us`; it waits only for the dataset to hold any table, not for a template's tables), skips unless exactly one company matches, and only replaces the unset value (`'none'`/`false`/null), with that filter repeated in the update itself. It logs `COMPANY_FLAG_SET`, `COMPANY_FLAG_SKIPPED` (with the reason) or `COMPANY_FLAG_FAILED`; a failure never fails the message, because a redelivery would dispatch the scaffold again. Each Supabase call times out after 5 seconds for the same reason: a hang past the Pub/Sub ack deadline would also redeliver. New datasets only: brands connected before this shipped aren't backfilled
-- **Source dataset ping (ENG-263):** after every successful GitHub dispatch, `createSourceDatasetNotifier()` POSTs `{"dataset_id": "<parent>__<client>"}` to `SUPABASE_SOURCE_DATASET_URL` with header `x-orca-source-secret: $SOURCE_DATASET_SECRET`. The ORCA app's `source-dataset-created` edge function (ENG-262) uses it to tick the source on the brand's onboarding checklist. It runs under the same condition as the dispatch: no ping for a dataset without a template, one still waiting for tables, one logged `NOT_DISPATCHING`, an `amazon*` dataset that only turns on the company setting, or a failed dispatch. It does ping a dataset dispatched with `missingTables` after `MAX_WAIT_HOURS` or after `TABLE_CHECK_FAILED`. It authenticates with the shared secret only and sends no `Authorization` header, so the edge function must be deployed with JWT verification off (`--no-verify-jwt`), or every ping fails with a 401 from Supabase's gateway. It logs `SOURCE_DATASET_PINGED`, `SOURCE_DATASET_PING_FAILED` (non-2xx, network error, or the 5-second timeout) or `SOURCE_DATASET_PING_SKIPPED` (variables not set). A failure never fails the message, for the same reason as the company setting: a redelivery would dispatch the scaffold again. The secret is never logged
+- **Source dataset ping (ENG-263):** after a message's successful GitHub dispatches (once per message, so once per piece when pieces are republished; the edge function ignores a repeat), `createSourceDatasetNotifier()` POSTs `{"dataset_id": "<parent>__<client>"}` to `SUPABASE_SOURCE_DATASET_URL` with header `x-orca-source-secret: $SOURCE_DATASET_SECRET`. The ORCA app's `source-dataset-created` edge function (ENG-262) uses it to tick the source on the brand's onboarding checklist. It runs under the same condition as the dispatch: no ping for a dataset without a template, one still waiting for tables, one logged `NOT_DISPATCHING`, an `amazon*` dataset that only turns on the company setting, or a failed dispatch. It does ping a dataset dispatched with `missingTables` after `MAX_WAIT_HOURS` or after `TABLE_CHECK_FAILED`. It authenticates with the shared secret only and sends no `Authorization` header, so the edge function must be deployed with JWT verification off (`--no-verify-jwt`), or every ping fails with a 401 from Supabase's gateway. It logs `SOURCE_DATASET_PINGED`, `SOURCE_DATASET_PING_FAILED` (non-2xx, network error, or the 5-second timeout) or `SOURCE_DATASET_PING_SKIPPED` (variables not set). A failure never fails the message, for the same reason as the company setting: a redelivery would dispatch the scaffold again. The secret is never logged
 - **Pacing model (ENG-299):** a scaffold for Shopify or a source the pacing model reads (`PACING_SOURCES`: Facebook, Google Ads, GA4 sessions, TikTok, AppLovin, Bing, LiveIntent, Pinterest, ShareASale, Snapchat, Twitter) also sends `models/pacing/pacing__<client>.sql`, rendered from orca-dbt's `templates/pacing/pacing.sql`. It goes in the payload's `generated` list with `vars`: `sources` (the dispatched source plus each other pacing source whose `<source>__<client>` dataset holds a table), `timezone_tag` (`daily3_<tag>`: the dbt Cloud schedule whose zone has the nearest January UTC offset to `companies.timezone`, `est` when unset) and `revenue` (`companies.revenue_measured_by` as a key such as `gross_discounts`; unset means Gross Revenue). So the model is written when the first source lands and re-rendered in each later source's scaffold PR. It waits for `shopify__<client>` to hold a table, because the model reads `shopify_newreturn__<client>`. orca-dbt's `.github/scripts/scaffold.js` writes `generated` files only while they're missing or still start with `-- orca:generated`, so the hand-built models are never touched, and leaves out any source whose dbt model isn't on `main` yet (its post-merge job re-renders the model after that scaffold merges). The settings come from Scaffold settings below. No pacing file (`PACING_SKIPPED`, with the reason) when the Supabase variables aren't set, the company isn't unique, `revenue_measured_by` is a custom definition (it needs a hand-built model), the settings couldn't be read, or the table check failed. A BigQuery error while planning it returns 503 so Pub/Sub redelivers (`PACING_CHECK_FAILED`): nothing has been dispatched yet, so that's safe. After `MAX_WAIT_HOURS`, or on a 4xx that won't clear by itself, the scaffold goes without it. `PACING_INCLUDED` logs what was sent. The old `pacing` catalog entry is gone: it waited for a `pacing__` dataset that no connector creates
 - **Scaffold settings (ENG-306):** every dispatch's `vars` also carry the brand's settings, read from `companies` by `createCompanySettingsReader()` for the one company whose `table_identifier` is the client (for `amazon*` datasets, the longest one the client starts with, as for the Amazon company setting). `timezone` is `companies.timezone` when it is an IANA zone (the ORCA app's `sanitizeTimezone` shape, and one `Intl` knows), which orca-dbt writes into the Shopify and Amazon SQL. `timezone_tag` is its dbt Cloud schedule suffix (`est`, `cst`, `mst`, `pst`, `gmt` or `aest`, by nearest January UTC offset), and orca-dbt picks each model's schedule tag from it. `revenue` is `companies.revenue_measured_by` as a `REVENUE_BASES` key (unset means `gross`), which picks `shopify_newreturn`'s `pacing_revenue` line. Anything unknown keeps what the templates hard-coded before: `America/New_York`, `est` and `gross`. That covers no Supabase variables, no unique company, an unset or non-IANA zone, and a custom revenue definition (that brand needs hand edits, as before). `SCAFFOLD_SETTINGS` logs what was sent, with `defaulted` naming each setting that wasn't used. A Supabase error returns 503 so Pub/Sub redelivers (`COMPANY_SETTINGS_FAILED`); after `MAX_WAIT_HOURS`, or on a 4xx, the scaffold goes with the defaults. Only new scaffolds pick this up: an existing brand's models change only when a dataset is dispatched again, and then orca-dbt shows the rewrite in a PR that waits for a person
 - **Custom output functions:** Some catalog entries use `out: (tpl, client) => filename` for non-standard naming
@@ -263,6 +273,32 @@ gcloud run services update orca-bigquery-dataset-listener --region us-central1 \
 
 After the next new source lands, check the logs for `SOURCE_DATASET_PINGED`. Datasets that landed before then aren't backfilled.
 
+### One-time setup for pieces
+
+Merging first is safe: until the variable is set, the listener logs `PIECES_TOPIC_UNSET` at startup, and a Seller Central dataset waits for both pieces in one message, then dispatches each.
+
+```bash
+# 1. The topic the listener's push subscription reads (the subscription found in
+#    step 2 of the table-check setup)
+SUBSCRIPTION=<the listener's push subscription>
+TOPIC=$(gcloud pubsub subscriptions describe "$SUBSCRIPTION" --format='value(topic)')
+
+# 2. Check what else reads that topic: every subscription gets the piece messages
+#    too. If anything besides the listener's subscription is listed, create a
+#    separate topic with its own push subscription to the listener instead.
+gcloud pubsub topics list-subscriptions "$TOPIC"
+
+# 3. Let the Cloud Run service account publish to it ($SA as in the table-check setup)
+gcloud pubsub topics add-iam-policy-binding "$TOPIC" \
+  --member="serviceAccount:$SA" --role="roles/pubsub.publisher"
+
+# 4. Set the variable (kept across Cloud Build deploys; starts a new revision)
+gcloud run services update orca-bigquery-dataset-listener --region us-central1 \
+  --update-env-vars SCAFFOLD_PIECES_TOPIC="$TOPIC"
+```
+
+A subscription with a message filter must let messages with the `orca_piece` attribute through. After the next Seller Central dataset lands, check the logs for `PIECES_PUBLISHED`, then a `NEW_DATASET_EVENT` with `piece: "summary"` and one with `piece: "detail"`.
+
 ### How to Deploy
 
 **Automated (recommended):**
@@ -309,7 +345,8 @@ function splitDataset(datasetId) {
 // server.js lines 201-205
 await dispatchToGitHub({
   datasetId,           // e.g., "shopify__acmecorp"
-  files: plan.files,   // Array of {template: "path", path: "output/path"}
+  piece,               // only for named pieces, e.g. "summary"
+  files,               // the piece's files: Array of {template: "path", path: "output/path"}
   vars: { ...plan.vars, ...settingVars }, // {datasetId, parent, client, project, timezone, timezone_tag, revenue}
 });
 ```

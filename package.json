@@ -5,7 +5,8 @@
   "type": "commonjs",
   "dependencies": {
     "@google-cloud/bigquery": "^9.1.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "google-auth-library": "^11.1.0"
   },
   "scripts": {
     "start": "node server.js",

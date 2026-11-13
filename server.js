@@ -1,6 +1,7 @@
 // server.js
 const express = require("express");
 const { BigQuery } = require("@google-cloud/bigquery");
+const { GoogleAuth } = require("google-auth-library");
 
 // --- Environment variables ---
 // Stored in Secret Manager; trimmed because a pasted trailing newline makes
@@ -19,6 +20,10 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // stor
 // newline is an invalid header value.
 const SUPABASE_SOURCE_DATASET_URL = (process.env.SUPABASE_SOURCE_DATASET_URL || "").trim();
 const SOURCE_DATASET_SECRET = (process.env.SOURCE_DATASET_SECRET || "").trim(); // stored in Secret Manager
+// The Pub/Sub topic the listener's push subscription reads, to republish a
+// dataset's event once per piece (see `piece` in the catalog). Unset, a dataset
+// with several pieces waits for all of them, then dispatches each on its own.
+const SCAFFOLD_PIECES_TOPIC = process.env.SCAFFOLD_PIECES_TOPIC;
 
 // --- 1️⃣ buildPlan logic ---
 function splitDataset(datasetId) {
@@ -39,13 +44,22 @@ function oPath(baseDir, rel, name) {
 // "dataset.a|b" is satisfied by either table, for loaders that name a table
 // differently.
 //
-// `requireSomeTables` drops a dataset in which no template has all of its tables
-// after the max wait, instead of dispatching anyway. Amazon datasets come with many
-// suffixes after the client (amazon_sellercentral__acme_airbyte_fulfillments,
-// Fivetran dbt-package outputs like amazon_ads__acme_amazon_ads_source) and
-// only some of them are the raw source a template reads. A suffixed dataset
-// can still hold one table a template reads (fulfilled shipments), which isn't
-// enough on its own.
+// `piece` groups the entries that are scaffolded together: each piece waits for
+// its own tables and goes in its own dispatch, so orca-dbt opens one PR per
+// piece. Entries without a piece form one piece. Seller Central has two (ENG-634):
+// its report, its Orders and its fulfilled shipments come from separate Airbyte
+// connections into one dataset, often days apart, and the summary model needs
+// only the report. With SCAFFOLD_PIECES_TOPIC set, the dataset's event is
+// republished once per piece, so the summary doesn't wait for the detail.
+//
+// `skipIncomplete` skips a piece that still lacks any of its tables after the
+// max wait, instead of dispatching it anyway with missingTables. Amazon datasets
+// come with many suffixes after the client
+// (amazon_sellercentral__acme_airbyte_fulfillments, Fivetran dbt-package outputs
+// like amazon_ads__acme_amazon_ads_source), and only some of them are the raw
+// source a template reads. A suffixed dataset can still hold one table a piece
+// reads (fulfilled shipments), which isn't enough on its own: the model wouldn't
+// build.
 //
 // `optional` entries read a table that most connections don't sync. They don't
 // hold up the dispatch: the file is scaffolded only when all of its tables
@@ -170,11 +184,14 @@ const CATALOG = {
       { rel: "shopify_pixel/percent_of_orders", tpl: "shopify_pixel_percentoforders" },
     ],
   },
+  // Three Amazon pieces (ENG-634): ads from the amazon_ads__<client> dataset,
+  // and summary and detail from the amazon_sellercentral__<client> dataset.
   amazon_ads: {
     dir: "amazon",
-    requireSomeTables: true,
+    skipIncomplete: true,
     entries: [
       {
+        piece: "ads",
         rel: "amazon_ads",
         tpl: "amazon_ads",
         tables: [
@@ -187,17 +204,20 @@ const CATALOG = {
     ],
   },
   // Seller Central is Airbyte only. Its report, Orders and fulfilled shipments
-  // come from separate connections into the same dataset.
+  // come from separate connections into the same dataset, so the summary (the
+  // report) and the detail (Orders and fulfilled shipments) are separate pieces.
   amazon_sellercentral: {
     dir: "amazon",
-    requireSomeTables: true,
+    skipIncomplete: true,
     entries: [
       {
+        piece: "summary",
         rel: "amazon_sellercentral",
         tpl: "amazon_sellercentral",
         tables: ["amazon_sellercentral__{client}.GET_SALES_AND_TRAFFIC_REPORT"],
       },
       {
+        piece: "detail",
         rel: "amazon_sellercentral_cohorts",
         tpl: "amazon_sellercentral_cohorts",
         tables: [
@@ -206,6 +226,7 @@ const CATALOG = {
         ],
       },
       {
+        piece: "detail",
         rel: "amazon_sellercentral_newreturn",
         tpl: "amazon_sellercentral_newreturn",
         tables: [
@@ -299,29 +320,31 @@ function buildPlan(datasetId, projectId) {
   if (!cfg) return null;
 
   const baseDir = cfg.dir || parent; // <— use alias if provided
-  const files = [];
-  const entryTables = [];
-  const tables = new Set();
-  const optional = [];
+  // In catalog order; `name` is null for entries without a piece.
+  const pieces = [];
   for (const e of cfg.entries) {
+    const name = e.piece || null;
+    let piece = pieces.find((p) => p.name === name);
+    if (!piece) pieces.push((piece = { name, files: [], tables: [], optional: [] }));
+
     const template = tPath(baseDir, e.rel, e.tpl);
     const outName = e.out ? e.out(e.tpl, client) : `${e.tpl}__${client}.sql`;
     const file = { template, path: oPath(baseDir, e.rel, outName) };
-    const filled = (e.tables || []).map((t) => t.replace("{client}", client));
+    const tables = (e.tables || []).map((t) => t.replace("{client}", client));
     if (e.optional) {
-      optional.push({ file, tables: filled, waitHours: e.waitHours || 0 });
+      piece.optional.push({ file, tables, waitHours: e.waitHours || 0 });
       continue;
     }
-    files.push(file);
-    entryTables.push(filled);
-    for (const t of filled) tables.add(t);
+    piece.files.push(file);
+    for (const t of tables) if (!piece.tables.includes(t)) piece.tables.push(t);
   }
   return {
-    files,
-    tables: [...tables],
-    entryTables,
-    optional,
-    requireSomeTables: Boolean(cfg.requireSomeTables),
+    pieces,
+    // Every piece's files and tables together.
+    files: pieces.flatMap((p) => p.files),
+    tables: [...new Set(pieces.flatMap((p) => p.tables))],
+    optional: pieces.flatMap((p) => p.optional),
+    skipIncomplete: Boolean(cfg.skipIncomplete),
     vars: { datasetId, parent, client, project: projectId },
   };
 }
@@ -669,13 +692,50 @@ function createSourceDatasetNotifier({ url, secret, fetchImpl = fetch, timeoutMs
   };
 }
 
-// --- 7️⃣ Express routes ---
+// --- 7️⃣ Pieces ---
+// The Pub/Sub message attribute that names the one piece a message is for.
+const PIECE_ATTRIBUTE = "orca_piece";
+
+// { piece } for a named piece, for log lines and the dispatch payload.
+const pieceField = (name) => (name ? { piece: name } : {});
+
+// "topic" or "projects/<project>/topics/topic" -> the full name; null when unset.
+function topicName(topic, project = PROJECT) {
+  const t = (topic || "").trim();
+  if (!t) return null;
+  return t.startsWith("projects/") ? t : `projects/${project}/topics/${t}`;
+}
+
+// Republishes a dataset's event once per piece, each message naming its piece,
+// so each piece waits for its own tables and dispatches on its own. The data is
+// the original log entry, so a piece's max wait still counts from the dataset's
+// creation. Capped like the Supabase calls: a hang past the Pub/Sub ack
+// deadline would redeliver.
+function createPiecePublisher({
+  topic,
+  auth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/pubsub"] }),
+  timeoutMs = 5000,
+}) {
+  return async function publishPieces(data, names) {
+    const resp = await auth.request({
+      url: `https://pubsub.googleapis.com/v1/${topic}:publish`,
+      method: "POST",
+      data: { messages: names.map((name) => ({ data, attributes: { [PIECE_ATTRIBUTE]: name } })) },
+      timeout: timeoutMs,
+      retry: false,
+    });
+    return resp.data.messageIds;
+  };
+}
+
+// --- 8️⃣ Express routes ---
 function createApp({
   bigquery,
   dispatch,
   setCompanyFlag = null,
   notifySourceDataset = null,
   readCompanySettings = null,
+  publishPieces = null,
   now = Date.now,
   maxWaitHours = MAX_WAIT_HOURS,
 }) {
@@ -693,9 +753,12 @@ function createApp({
       const entry = data?.protoPayload || {};
       const resourceName = entry.resourceName || "";
       const datasetId = resourceName.split("/").pop() || "";
+      // Set on the messages the listener republishes, one per piece.
+      const pieceName = msg?.attributes?.[PIECE_ATTRIBUTE] || null;
 
       console.log("NEW_DATASET_EVENT", {
         datasetId,
+        ...pieceField(pieceName),
         resourceName,
         who: entry?.authenticationInfo?.principalEmail,
         locations: entry?.resourceLocation?.currentLocations,
@@ -711,23 +774,51 @@ function createApp({
       }
 
       // The log entry's timestamp is when the dataset was created, and it stays
-      // the same on every Pub/Sub redelivery.
+      // the same on every Pub/Sub redelivery and in each piece's message.
       const createdAt = Date.parse(data?.timestamp || msg?.publishTime || "") || now();
       const waitedHours = Math.round(((now() - createdAt) / 3600000) * 10) / 10;
 
-      // A plan waits for its template's tables; the Amazon setting only for the
-      // dataset to hold any table.
-      let missing = [];
+      // Until something is dispatched a redelivery after an error is safe, but a
+      // 4xx (bad key, no permission) won't clear by itself.
+      const retry = (e) => {
+        const status = e.status ?? e.code;
+        return !(status >= 400 && status < 500) && waitedHours < maxWaitHours;
+      };
+
+      // The pieces this message handles: the one it names, or all of them.
+      let pieces = plan ? plan.pieces : [];
+      if (pieceName) {
+        pieces = pieces.filter((p) => p.name === pieceName);
+        if (!pieces.length) {
+          console.warn("UNKNOWN_PIECE", { datasetId, piece: pieceName });
+          return res.status(204).end();
+        }
+      } else if (pieces.length > 1 && publishPieces) {
+        // One message per piece, and this one is done. Nothing has been
+        // dispatched from it, so a failed publish can be retried.
+        const names = pieces.map((p) => p.name);
+        try {
+          const messageIds = await publishPieces(msg.data, names);
+          console.log("PIECES_PUBLISHED", { datasetId, pieces: names, messageIds });
+          return res.status(204).end();
+        } catch (e) {
+          if (retry(e)) {
+            console.error("PIECES_PUBLISH_FAILED", { datasetId, error: e.message, waitedHours });
+            return res.status(503).end();
+          }
+          // No topic or no permission: handle every piece in this message.
+          console.error("PIECES_PUBLISH_FAILED", { datasetId, error: e.message, status: e.status, handling: "all pieces here" });
+        }
+      }
+
+      // Pieces wait for their tables; the Amazon setting only for the dataset
+      // to hold any table.
       let absent = new Set(); // optional entries' tables included
       let landed = false;
       let tablesChecked = false;
       try {
-        if (plan) {
-          absent = new Set(
-            await findMissingTables(bigquery, [...plan.tables, ...plan.optional.flatMap((o) => o.tables)])
-          );
-          missing = plan.tables.filter((t) => absent.has(t));
-        }
+        const wanted = new Set(pieces.flatMap((p) => [...p.tables, ...p.optional.flatMap((o) => o.tables)]));
+        absent = new Set(await findMissingTables(bigquery, [...wanted]));
         if (flag?.matchClientPrefix) landed = (await listTables(bigquery, datasetId)).size > 0;
         tablesChecked = true;
       } catch (e) {
@@ -735,98 +826,107 @@ function createApp({
         console.error("TABLE_CHECK_FAILED", { datasetId, error: e.message });
       }
 
-      const awaitedOptional = plan
-        ? plan.optional
-            .filter((o) => waitedHours < o.waitHours)
-            .flatMap((o) => o.tables.filter((t) => absent.has(t)))
-        : [];
-      const waiting = plan ? missing.length > 0 || awaitedOptional.length > 0 : tablesChecked && !landed;
+      const missingOf = (p) => p.tables.filter((t) => absent.has(t));
+      // The optional tables a piece still holds out for (`waitHours`).
+      const awaitedOf = (p) =>
+        p.optional.filter((o) => waitedHours < o.waitHours).flatMap((o) => o.tables.filter((t) => absent.has(t)));
+      const missing = [...new Set(pieces.flatMap(missingOf))];
+      const awaited = [...new Set(pieces.flatMap(awaitedOf))];
+      const waiting = plan ? missing.length > 0 || awaited.length > 0 : tablesChecked && !landed;
       if (waiting && waitedHours < maxWaitHours) {
-        console.log("WAITING_FOR_TABLES", { datasetId, missing: [...missing, ...awaitedOptional], waitedHours });
+        console.log("WAITING_FOR_TABLES", { datasetId, ...pieceField(pieceName), missing: [...missing, ...awaited], waitedHours });
         // Any non-2xx response makes Pub/Sub redeliver the message later.
         return res.status(429).end();
       }
 
-      if (plan) {
-        const noTemplateReady =
-          tablesChecked && plan.tables.length > 0 && !plan.entryTables.some((ts) => ts.every((t) => !absent.has(t)));
-        if (plan.requireSomeTables && noTemplateReady) {
-          console.warn("NOT_DISPATCHING", { datasetId, reason: "no template has all of its tables", missing, waitedHours });
+      // A piece still missing tables after the max wait goes anyway, with
+      // missingTables, unless the catalog skips incomplete pieces.
+      const ready = [];
+      for (const p of pieces) {
+        const pieceMissing = missingOf(p);
+        if (plan.skipIncomplete && pieceMissing.length) {
+          const reason = "the piece's tables didn't all land";
+          console.warn("NOT_DISPATCHING", { datasetId, ...pieceField(p.name), reason, missing: pieceMissing, waitedHours });
         } else {
-          if (missing.length) {
-            console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });
+          ready.push(p);
+        }
+      }
+
+      if (ready.length) {
+        // Every scaffold renders in the brand's timezone and revenue basis.
+        let settings = { status: "disabled" };
+        if (readCompanySettings) {
+          try {
+            settings = await readCompanySettings(parts.client, { matchClientPrefix: Boolean(flag?.matchClientPrefix) });
+          } catch (e) {
+            if (retry(e)) {
+              console.error("COMPANY_SETTINGS_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
+              return res.status(503).end();
+            }
+            settings = { status: "check_failed", error: e.message };
           }
-          const files = [...plan.files];
-          for (const o of plan.optional) {
+        }
+        const { vars: settingVars, defaulted } = scaffoldSettings(settings);
+
+        // A failed table check says nothing about which sources landed.
+        let pacing = null;
+        if (!tablesChecked) {
+          if (PACING_SOURCES.includes(parts.parent)) pacing = { skip: "tables_unchecked" };
+        } else {
+          try {
+            pacing = await planPacing({ bigquery, settings, ...parts });
+          } catch (e) {
+            if (retry(e)) {
+              console.error("PACING_CHECK_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
+              return res.status(503).end();
+            }
+            pacing = { skip: "check_failed", error: e.message };
+          }
+        }
+        if (pacing?.skip) {
+          const { skip, ...detail } = pacing;
+          console.log("PACING_SKIPPED", { datasetId, reason: skip, ...detail });
+        }
+
+        // One dispatch, and so one orca-dbt PR, per piece. A failed dispatch
+        // returns 500 so Pub/Sub redelivers, which sends any piece dispatched
+        // before it in this message again (orca-dbt opens a second PR, or finds
+        // the files unchanged once the first has merged).
+        for (const [i, p] of ready.entries()) {
+          const pieceMissing = missingOf(p);
+          if (pieceMissing.length) {
+            console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, ...pieceField(p.name), missing: pieceMissing, waitedHours });
+          }
+          const files = [...p.files];
+          for (const o of p.optional) {
             const notThere = o.tables.filter((t) => absent.has(t));
             if (notThere.length) console.log("SKIPPING_OPTIONAL_MODEL", { datasetId, path: o.file.path, missing: notThere });
             else files.push(o.file);
           }
-
-          // Nothing is dispatched yet, so a redelivery after an error is safe,
-          // but a 4xx (bad key, no permission) won't clear by itself.
-          const retry = (e) => {
-            const status = e.status ?? e.code;
-            return !(status >= 400 && status < 500) && waitedHours < maxWaitHours;
-          };
-
-          // Every scaffold renders in the brand's timezone and revenue basis.
-          let settings = { status: "disabled" };
-          if (readCompanySettings) {
-            try {
-              settings = await readCompanySettings(parts.client, { matchClientPrefix: Boolean(flag?.matchClientPrefix) });
-            } catch (e) {
-              if (retry(e)) {
-                console.error("COMPANY_SETTINGS_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
-                return res.status(503).end();
-              }
-              settings = { status: "check_failed", error: e.message };
-            }
-          }
-          const { vars: settingVars, defaulted } = scaffoldSettings(settings);
-
-          // A failed table check says nothing about which sources landed.
-          let pacing = null;
-          if (!tablesChecked) {
-            if (PACING_SOURCES.includes(parts.parent)) pacing = { skip: "tables_unchecked" };
-          } else {
-            try {
-              pacing = await planPacing({ bigquery, settings, ...parts });
-            } catch (e) {
-              if (retry(e)) {
-                console.error("PACING_CHECK_FAILED", { datasetId, error: e.message, cause: e.cause?.message, waitedHours });
-                return res.status(503).end();
-              }
-              pacing = { skip: "check_failed", error: e.message };
-            }
-          }
-          if (pacing?.skip) {
-            const { skip, ...detail } = pacing;
-            console.log("PACING_SKIPPED", { datasetId, reason: skip, ...detail });
-          }
-
           await dispatch({
             datasetId,
+            ...pieceField(p.name),
             files,
-            ...(pacing?.file && { generated: [pacing.file] }),
+            // The pacing model goes once, with the first piece.
+            ...(i === 0 && pacing?.file && { generated: [pacing.file] }),
             vars: { ...plan.vars, ...settingVars },
-            missingTables: missing,
+            missingTables: pieceMissing,
           });
-          console.log("✅ Dispatched to GitHub for", datasetId);
-          console.log("SCAFFOLD_SETTINGS", { datasetId, ...settingVars, ...(Object.keys(defaulted).length && { defaulted }) });
-          if (pacing?.file) console.log("PACING_INCLUDED", { datasetId, path: pacing.file.path, ...pacing.file.vars });
+          console.log("✅ Dispatched to GitHub for", datasetId, ...(p.name ? [`(${p.name})`] : []));
+        }
+        console.log("SCAFFOLD_SETTINGS", { datasetId, ...settingVars, ...(Object.keys(defaulted).length && { defaulted }) });
+        if (pacing?.file) console.log("PACING_INCLUDED", { datasetId, path: pacing.file.path, ...pacing.file.vars });
 
-          // Errors are logged, not returned, because a retry would re-dispatch.
-          if (!notifySourceDataset) {
-            console.log("SOURCE_DATASET_PING_SKIPPED", { datasetId, reason: "SUPABASE_SOURCE_DATASET_URL or SOURCE_DATASET_SECRET not set" });
-          } else {
-            try {
-              const status = await notifySourceDataset(datasetId);
-              console.log("SOURCE_DATASET_PINGED", { datasetId, status });
-            } catch (e) {
-              // fetch's own message is just "fetch failed"; the cause says why.
-              console.error("SOURCE_DATASET_PING_FAILED", { datasetId, error: e.message, cause: e.cause?.message });
-            }
+        // Errors are logged, not returned, because a retry would re-dispatch.
+        if (!notifySourceDataset) {
+          console.log("SOURCE_DATASET_PING_SKIPPED", { datasetId, reason: "SUPABASE_SOURCE_DATASET_URL or SOURCE_DATASET_SECRET not set" });
+        } else {
+          try {
+            const status = await notifySourceDataset(datasetId);
+            console.log("SOURCE_DATASET_PINGED", { datasetId, status });
+          } catch (e) {
+            // fetch's own message is just "fetch failed"; the cause says why.
+            console.error("SOURCE_DATASET_PING_FAILED", { datasetId, error: e.message, cause: e.cause?.message });
           }
         }
       }
@@ -867,12 +967,18 @@ if (require.main === module) {
     SUPABASE_SOURCE_DATASET_URL && SOURCE_DATASET_SECRET
       ? createSourceDatasetNotifier({ url: SUPABASE_SOURCE_DATASET_URL, secret: SOURCE_DATASET_SECRET })
       : null;
+  const piecesTopic = topicName(SCAFFOLD_PIECES_TOPIC);
+  const publishPieces = piecesTopic ? createPiecePublisher({ topic: piecesTopic }) : null;
+  if (!publishPieces) {
+    console.warn("PIECES_TOPIC_UNSET: SCAFFOLD_PIECES_TOPIC not set (a dataset with several pieces waits for all of them, then dispatches each on its own)");
+  }
   const app = createApp({
     bigquery: new BigQuery({ projectId: PROJECT }),
     dispatch: dispatchToGitHub,
     setCompanyFlag,
     notifySourceDataset,
     readCompanySettings,
+    publishPieces,
   });
   const PORT = process.env.PORT || 8080;
   app.listen(PORT, () => console.log(`listener on :${PORT}`));
@@ -886,7 +992,10 @@ module.exports = {
   createCompanyFlagSetter,
   createCompanySettingsReader,
   createSourceDatasetNotifier,
+  createPiecePublisher,
   createApp,
+  PIECE_ATTRIBUTE,
   scaffoldSettings,
   timezoneTag,
+  topicName,
 };

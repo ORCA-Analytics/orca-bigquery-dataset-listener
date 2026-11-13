@@ -239,6 +239,15 @@ const CATALOG = {
     ],
   },
   applovin: { entries: [{ rel: "", tpl: "applovin", tables: ["applovin__{client}.ad_report_daily"] }] },
+  chatgpt_ads: {
+    entries: [
+      {
+        rel: "",
+        tpl: "chatgpt_ads",
+        tables: ["chatgpt_ads__{client}.ad_insights", "chatgpt_ads__{client}.ad_conversions", "chatgpt_ads__{client}.ad_account"],
+      },
+    ],
+  },
   bing_ads: {
     entries: [{ rel: "", tpl: "bing_ads", tables: ["bing_ads__{client}.campaign_performance_report_daily"] }],
   },

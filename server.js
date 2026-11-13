@@ -9,6 +9,8 @@ const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 const GH_OWNER = "ORCA-Analytics";
 const GH_REPO = "orca-dbt";
 const PROJECT = "orcaanalytics";
+// Where dbt builds the production models.
+const ANALYTICS_DATASET = "analytics";
 // How long to keep waiting for a new dataset's tables before dispatching anyway.
 const MAX_WAIT_HOURS = Number(process.env.MAX_WAIT_HOURS || 72);
 // Supabase project with the `companies` table the ORCA app reads its settings from.
@@ -596,9 +598,11 @@ function scaffoldSettings(settings) {
 
 // The pacing file to send with a scaffold of `parent`, or `skip` with the
 // reason; null when `parent` isn't a pacing source. Landed sources are the
-// dispatched one plus each other source whose dataset holds a table (orca-dbt
-// leaves out any whose model isn't on main yet). `settings` is the company's
-// readCompanySettings result. Throws on a BigQuery error.
+// dispatched one plus each other source whose dataset holds a table. `built` is
+// the brand's tables in analytics: orca-dbt leaves out any source whose model
+// isn't on main or isn't built yet, since the PR's CI can't ref an unbuilt
+// model (milkymama, OPS-233). `settings` is the company's readCompanySettings
+// result. Throws on a BigQuery error.
 async function planPacing({ bigquery, settings, parent, client }) {
   if (!PACING_SOURCES.includes(parent)) return null;
   if (settings.status === "disabled") return { skip: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set" };
@@ -617,12 +621,13 @@ async function planPacing({ bigquery, settings, parent, client }) {
   if (defaulted.revenue_measured_by) {
     return { skip: "revenue_measured_by needs a hand-built model", revenueMeasuredBy: defaulted.revenue_measured_by };
   }
+  const built = [...(await listTables(bigquery, ANALYTICS_DATASET))].filter((t) => t.includes(`__${client}`)).sort();
 
   return {
     file: {
       template: "templates/pacing/pacing.sql",
       path: `models/pacing/pacing__${client}.sql`,
-      vars: { sources, timezone_tag: vars.timezone_tag, revenue: vars.revenue },
+      vars: { sources, built, timezone_tag: vars.timezone_tag, revenue: vars.revenue },
     },
   };
 }

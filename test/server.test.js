@@ -627,7 +627,7 @@ test("first render: Shopify's scaffold sends the pacing model with the company's
   const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readCompanySettings });
   assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 204);
   assert.deepEqual(dispatched[0].generated, [
-    { ...PACING_FILE, vars: { sources: ["shopify"], timezone_tag: "pst", revenue: "gross_discounts" } },
+    { ...PACING_FILE, vars: { sources: ["shopify"], built: [], timezone_tag: "pst", revenue: "gross_discounts" } },
   ]);
   assert.deepEqual(dispatched[0].files, buildPlan("shopify__acme", "orcaanalytics").files);
   assert.deepEqual(reads, ["acme"]);
@@ -650,6 +650,30 @@ test("re-render: a new source's scaffold sends the model with every source that 
   );
   assert.equal(await deliver(app, pubsubBody("facebook_ads__acme", NOW - HOUR)), 204);
   assert.deepEqual(dispatched[0].generated[0].vars.sources, ["shopify", "facebook_ads", "google_ads"]);
+});
+
+// OPS-233: a merged scaffold isn't built until its post-merge run or the next
+// wave, and the Shopify scaffold's CI can't ref it before then.
+test("sends the brand's built analytics tables, so orca-dbt leaves out unbuilt sources", async () => {
+  const { readCompanySettings } = companySettings();
+  const { app, dispatched } = setup(
+    {
+      datasets: {
+        shopify__acme: SHOPIFY_TABLES,
+        facebook_ads__acme: FACEBOOK_TABLES,
+        google_ads__acme: ["custom_campaign"],
+        analytics: ["google_ads__acme", "google_analytics_4__acme_sessionscvr", "google_ads__acmeco", "pacing__other"],
+      },
+    },
+    { readCompanySettings }
+  );
+  assert.equal(await deliver(app, pubsubBody("shopify__acme", NOW - HOUR)), 204);
+  assert.deepEqual(dispatched[0].generated[0].vars.sources, ["shopify", "facebook_ads", "google_ads"]);
+  assert.deepEqual(dispatched[0].generated[0].vars.built, [
+    "google_ads__acme",
+    "google_ads__acmeco",
+    "google_analytics_4__acme_sessionscvr",
+  ]);
 });
 
 test("a spend source that lands before Shopify sends no pacing model yet", async (t) => {
@@ -678,7 +702,7 @@ test("unset settings render as est and Gross Revenue", async () => {
   const { readCompanySettings } = companySettings({ company: { timezone: null, revenue_measured_by: null } });
   const { app, dispatched } = setup({ datasets: { shopify__acme: SHOPIFY_TABLES } }, { readCompanySettings });
   await deliver(app, pubsubBody("shopify__acme", NOW - HOUR));
-  assert.deepEqual(dispatched[0].generated[0].vars, { sources: ["shopify"], timezone_tag: "est", revenue: "gross" });
+  assert.deepEqual(dispatched[0].generated[0].vars, { sources: ["shopify"], built: [], timezone_tag: "est", revenue: "gross" });
 });
 
 test("no pacing model for an unmatched company or a custom revenue definition; the scaffold still goes", async (t) => {

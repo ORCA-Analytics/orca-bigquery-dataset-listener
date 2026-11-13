@@ -36,14 +36,16 @@ function oPath(baseDir, rel, name) {
 // `tables` lists the raw tables each template reads, as "dataset.table" with
 // {client} filled in at dispatch time. The listener waits for all of them to
 // exist before dispatching, so keep them in sync with the templates in orca-dbt.
-// "dataset.a|b" is satisfied by either table (loaders name some tables
-// differently, e.g. Airbyte `Orders` vs Fivetran `orders`).
+// "dataset.a|b" is satisfied by either table, for loaders that name a table
+// differently.
 //
-// `requireSomeTables` drops a dataset that still has none of its tables after
-// the max wait instead of dispatching anyway. Amazon datasets come with many
+// `requireSomeTables` drops a dataset in which no template has all of its tables
+// after the max wait, instead of dispatching anyway. Amazon datasets come with many
 // suffixes after the client (amazon_sellercentral__acme_airbyte_fulfillments,
 // Fivetran dbt-package outputs like amazon_ads__acme_amazon_ads_source) and
-// only some of them are the raw source a template reads.
+// only some of them are the raw source a template reads. A suffixed dataset
+// can still hold one table a template reads (fulfilled shipments), which isn't
+// enough on its own.
 //
 // `optional` entries read a table that most connections don't sync. They don't
 // hold up the dispatch: the file is scaffolded only when all of its tables
@@ -184,6 +186,8 @@ const CATALOG = {
       },
     ],
   },
+  // Seller Central is Airbyte only. Its report, Orders and fulfilled shipments
+  // come from separate connections into the same dataset.
   amazon_sellercentral: {
     dir: "amazon",
     requireSomeTables: true,
@@ -191,17 +195,23 @@ const CATALOG = {
       {
         rel: "amazon_sellercentral",
         tpl: "amazon_sellercentral",
-        tables: ["amazon_sellercentral__{client}.GET_SALES_AND_TRAFFIC_REPORT|sales_and_traffic_business_report_daily"],
+        tables: ["amazon_sellercentral__{client}.GET_SALES_AND_TRAFFIC_REPORT"],
       },
       {
         rel: "amazon_sellercentral_cohorts",
         tpl: "amazon_sellercentral_cohorts",
-        tables: ["amazon_sellercentral__{client}.Orders|orders"],
+        tables: [
+          "amazon_sellercentral__{client}.Orders",
+          "amazon_sellercentral__{client}.GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
+        ],
       },
       {
         rel: "amazon_sellercentral_newreturn",
         tpl: "amazon_sellercentral_newreturn",
-        tables: ["amazon_sellercentral__{client}.Orders|orders"],
+        tables: [
+          "amazon_sellercentral__{client}.Orders",
+          "amazon_sellercentral__{client}.GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
+        ],
       },
     ],
   },
@@ -290,23 +300,26 @@ function buildPlan(datasetId, projectId) {
 
   const baseDir = cfg.dir || parent; // <— use alias if provided
   const files = [];
+  const entryTables = [];
   const tables = new Set();
   const optional = [];
   for (const e of cfg.entries) {
     const template = tPath(baseDir, e.rel, e.tpl);
     const outName = e.out ? e.out(e.tpl, client) : `${e.tpl}__${client}.sql`;
     const file = { template, path: oPath(baseDir, e.rel, outName) };
-    const entryTables = (e.tables || []).map((t) => t.replace("{client}", client));
+    const filled = (e.tables || []).map((t) => t.replace("{client}", client));
     if (e.optional) {
-      optional.push({ file, tables: entryTables, waitHours: e.waitHours || 0 });
+      optional.push({ file, tables: filled, waitHours: e.waitHours || 0 });
       continue;
     }
     files.push(file);
-    for (const t of entryTables) tables.add(t);
+    entryTables.push(filled);
+    for (const t of filled) tables.add(t);
   }
   return {
     files,
     tables: [...tables],
+    entryTables,
     optional,
     requireSomeTables: Boolean(cfg.requireSomeTables),
     vars: { datasetId, parent, client, project: projectId },
@@ -735,9 +748,10 @@ function createApp({
       }
 
       if (plan) {
-        const nothingLanded = tablesChecked && plan.tables.length > 0 && missing.length === plan.tables.length;
-        if (plan.requireSomeTables && nothingLanded) {
-          console.warn("NOT_DISPATCHING", { datasetId, reason: "none of the template's tables landed", missing, waitedHours });
+        const noTemplateReady =
+          tablesChecked && plan.tables.length > 0 && !plan.entryTables.some((ts) => ts.every((t) => !absent.has(t)));
+        if (plan.requireSomeTables && noTemplateReady) {
+          console.warn("NOT_DISPATCHING", { datasetId, reason: "no template has all of its tables", missing, waitedHours });
         } else {
           if (missing.length) {
             console.warn("DISPATCHING_WITH_MISSING_TABLES", { datasetId, missing, waitedHours });

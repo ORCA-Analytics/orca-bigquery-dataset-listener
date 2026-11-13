@@ -182,6 +182,12 @@ function recordPieces({ error } = {}) {
 
 const piece = (name) => ({ [PIECE_ATTRIBUTE]: name });
 
+test("chatgpt_ads scaffolds its model once insights, conversions and the ad account land (ENG-645)", () => {
+  const plan = buildPlan("chatgpt_ads__acme", "orcaanalytics");
+  assert.deepEqual(plan.files, [{ template: "templates/chatgpt_ads/chatgpt_ads.sql", path: "models/chatgpt_ads/chatgpt_ads__acme.sql" }]);
+  assert.deepEqual(plan.tables, ["chatgpt_ads__acme.ad_insights", "chatgpt_ads__acme.ad_conversions", "chatgpt_ads__acme.ad_account"]);
+});
+
 test("Amazon is three pieces: ads, and Seller Central's summary and detail", () => {
   const ads = buildPlan("amazon_ads__acme", "orcaanalytics");
   assert.deepEqual(ads.pieces, [

@@ -519,6 +519,7 @@ const PACING_SOURCES = [
   "shareasale",
   "snapchat_ads",
   "twitter_ads",
+  "chatgpt_ads",
 ];
 
 // companies.revenue_measured_by -> the templates' revenue line (the pacing

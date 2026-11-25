@@ -405,6 +405,7 @@ const COMPANY_FLAGS = {
   pinterest_ads: { column: "pinterest_ads", value: true, unset: false },
   snapchat_ads: { column: "snapchat_ads", value: true, unset: false },
   twitter_ads: { column: "twitter_ads", value: true, unset: false },
+  chatgpt_ads: { column: "chatgpt_ads", value: true, unset: false },
   applovin: { column: "applovin_ads", value: true, unset: false },
   fairing: { column: "hdyhau", value: "Fairing", unset: "none" },
   knocommerce: { column: "hdyhau", value: "KnoCommerce", unset: "none" },
